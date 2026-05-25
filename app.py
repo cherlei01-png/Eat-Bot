@@ -197,7 +197,7 @@ def get_main_quick_reply():
     return QuickReply(
         items=[
             QuickReplyItem(
-                action=PostbackAction(label="➕ 加入餐廳", data="menu_action=click_add", displayText=" quiero_add (點擊了加入餐廳)")
+                action=PostbackAction(label="➕ 加入餐廳", data="menu_action=click_add", displayText="點擊了加入餐廳")
             ),
             QuickReplyItem(
                 action=PostbackAction(label="📋 我的口袋名單", data="menu_action=click_list", displayText="查看口袋名單")
