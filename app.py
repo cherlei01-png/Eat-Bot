@@ -442,29 +442,41 @@ def handle_postback(event):
 
     # 新增：處理主選單點擊「🎲 隨機推薦」
     elif menu_action == 'click_random':
-        lucky_restaurant = get_random_restaurant(user_id)
-        if not lucky_restaurant:
-            send_reply(event.reply_token, [TextMessage(text="你的口袋名單目前沒有任何餐廳，抽不到東西喔！")], menu_type='main')
+        # 1. 從你原本的資料庫隨機抽出一間餐廳 (假設回傳 row, row[0] 是餐廳名稱)
+        row = get_random_restaurant(user_id)
+        
+        if not row:
+            send_reply(event.reply_token, [TextMessage(text="你的口袋名單目前沒有任何餐廳，抽不到東西喔！")], include_menu=True)
         else:
-            name = lucky_restaurant['name']
-            url = lucky_restaurant['url']
+            restaurant_name = row[0]  # 取得餐廳名稱
             
-            tags = get_restaurant_tags(user_id, name)
-            tag_str = " ".join([f"#{t}" for t in tags]) if tags else ""
+            # 2. 【核心功能】自動拼出 Google Maps 模糊搜尋兼導航的萬用網址
+            # quote 會把中文換成網址編碼（例如：麥當勞 -> %E9%BA%A5%E7%95%B6%E5%8B%9E），並強制用外部瀏覽器開啟
+            encoded_name = urllib.parse.quote(restaurant_name)
+            maps_url = f"https://www.google.com/maps/search/?api=1&query={encoded_name}&openExternalBrowser=1"
             
-            main_text = f"🎲 今天的推薦餐廳是：\n\n✨【 {name} 】✨\n{tag_str}".strip()
+            # 3. 使用 ButtonsTemplate 漂亮地列出名稱，並附上導航按鈕
+            column = CarouselColumn(
+                title=f"🎲 今日推薦：{restaurant_name[:30]}",
+                text="為您隨機挑選的美味，點擊下方開始導航吧！",
+                actions=[
+                    URIAction(label="🗺️ 開始導航 (自動搜尋)", uri=maps_url),
+                    PostbackAction(
+                        label="❌ 刪除餐廳",
+                        data=f"action=delete_confirm&name={urllib.parse.quote(restaurant_name)}",
+                        displayText=f"確認刪除 {restaurant_name}"
+                    )
+                ]
+            )
             
-            if url:
-                # 如果這家餐廳有綁定網址，就用 ButtonsTemplate 漂亮地秀出地圖按鈕
-                buttons_template = ButtonsTemplate(
-                    title="為您推薦",
-                    text=main_text[:160], # 確保不超過 LINE 內文限制
-                    actions=[URIAction(label="🗺️ 一鍵導航 (開啟地圖)", uri=url)]
-                )
-                send_reply(event.reply_token, [TemplateMessage(alt_text="今日隨機推薦餐廳", template=buttons_template)], menu_type='main')
-            else:
-                # 沒網址就單純回覆文字
-                send_reply(event.reply_token, [TextMessage(text=main_text)], menu_type='main')
+            carousel_template = CarouselTemplate(columns=[column])
+            template_message = TemplateMessage(
+                alt_text=f"今日推薦餐廳：{restaurant_name}",
+                template=carousel_template
+            )
+            
+            # 發送圖卡，並帶上主選單提示
+            send_reply(event.reply_token, [template_message, TextMessage(text="今天就決定吃這家了嗎？😋")], include_menu=True)
         return
 
     # ================= 2. 處理 Template 的動作 =================
