@@ -440,22 +440,23 @@ def handle_postback(event):
         send_reply(event.reply_token, [TextMessage(text="已退出名單模式，回到主選單。")], menu_type='main')
         return
 
-    # 新增：處理主選單點擊「🎲 隨機推薦」
+    # 修正後：處理主選單點擊「🎲 隨機推薦」
     elif menu_action == 'click_random':
-        # 1. 從你原本的資料庫隨機抽出一間餐廳 (假設回傳 row, row[0] 是餐廳名稱)
-        row = get_random_restaurant(user_id)
+        # 1. 從資料庫隨機抽出一間餐廳 (此函數回傳的是字典)
+        res_data = get_random_restaurant(user_id)
         
-        if not row:
-            send_reply(event.reply_token, [TextMessage(text="你的口袋名單目前沒有任何餐廳，抽不到東西喔！")], include_menu=True)
+        if not res_data:
+            # 💡 修正點：將 include_menu=True 改為正確的 menu_type='main'
+            send_reply(event.reply_token, [TextMessage(text="你的口袋名單目前沒有任何餐廳，抽不到東西喔！")], menu_type='main')
         else:
-            restaurant_name = row[0]  # 取得餐廳名稱
+            # 💡 修正點：從字典中用 key 取出餐廳名稱
+            restaurant_name = res_data['name']  
             
-            # 2. 【核心功能】自動拼出 Google Maps 模糊搜尋兼導航的萬用網址
-            # quote 會把中文換成網址編碼（例如：麥當勞 -> %E9%BA%A5%E7%95%B6%E5%8B%9E），並強制用外部瀏覽器開啟
+            # 2. 自動拼出 Google Maps 模糊搜尋的萬用網址
             encoded_name = urllib.parse.quote(restaurant_name)
-            maps_url = f"https://www.google.com/maps/search/?api=1&query={encoded_name}&openExternalBrowser=1"
+            maps_url = f"https://www.google.com/maps/search/?api=1&query={encoded_name}"
             
-            # 3. 使用 ButtonsTemplate 漂亮地列出名稱，並附上導航按鈕
+            # 3. 使用 CarouselColumn 與 TemplateMessage 封裝
             column = CarouselColumn(
                 title=f"🎲 今日推薦：{restaurant_name[:30]}",
                 text="為您隨機挑選的美味，點擊下方開始導航吧！",
@@ -475,8 +476,8 @@ def handle_postback(event):
                 template=carousel_template
             )
             
-            # 發送圖卡，並帶上主選單提示
-            send_reply(event.reply_token, [template_message, TextMessage(text="今天就決定吃這家了嗎？😋")], include_menu=True)
+            # 💡 修正點：將 include_menu=True 改為正確的 menu_type='main'，讓主選單能附在文字訊息後面
+            send_reply(event.reply_token, [template_message, TextMessage(text="今天就決定吃這家了嗎？😋")], menu_type='main')
         return
 
     # ================= 2. 處理 Template 的動作 =================
