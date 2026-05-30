@@ -101,6 +101,14 @@ def init_db():
         )
     ''')
 
+    # 💡 新增 6. 使用者計數統計表（專門記錄無法從現有資料撈出的數據，如：刪除次數）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_stats (
+            user_id TEXT PRIMARY KEY,
+            deleted_count INTEGER DEFAULT 0
+        )
+    ''')
+
     conn.commit()
     cursor.close()
     conn.close()
@@ -230,6 +238,13 @@ def delete_restaurant(user_id, restaurant_name):
     cursor.execute('DELETE FROM restaurant_tags WHERE user_id = %s AND restaurant_name = %s', (user_id, restaurant_name))
     cursor.execute('DELETE FROM pocket_list WHERE user_id = %s AND restaurant_name = %s', (user_id, restaurant_name))
     changes = cursor.rowcount
+
+    if changes > 0:
+        cursor.execute('''
+            INSERT INTO user_stats (user_id, deleted_count) VALUES (%s, 1)
+            ON CONFLICT (user_id) DO UPDATE SET deleted_count = user_stats.deleted_count + 1
+        ''', (user_id,))
+
     conn.commit()
     cursor.close()
     conn.close()
@@ -336,6 +351,32 @@ def get_user_state(user_id):
     conn.close()
     return row[0] if row else 'IDLE'
 
+# 新增：動態統計使用者的各項操作數據
+def get_user_achievement_stats(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    stats = {'added': 0, 'visited': 0, 'deleted': 0}
+    try:
+        # 1. 統計目前名單內的餐廳數 (新增次數)
+        cursor.execute('SELECT COUNT(*) FROM pocket_list WHERE user_id = %s', (user_id,))
+        stats['added'] = cursor.fetchone()[0]
+        
+        # 2. 統計總用餐次數
+        cursor.execute('SELECT COUNT(*) FROM user_cooling_history WHERE user_id = %s', (user_id,))
+        stats['visited'] = cursor.fetchone()[0]
+        
+        # 3. 讀取總刪除次數
+        cursor.execute('SELECT deleted_count FROM user_stats WHERE user_id = %s', (user_id,))
+        row = cursor.fetchone()
+        stats['deleted'] = row[0] if row else 0
+        
+    except Exception as e:
+        print(f"Achievement stats error: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+    return stats
+
 # ====================================================================
 
 @app.route("/callback", methods=['POST'])
@@ -359,7 +400,8 @@ def get_main_quick_reply():
         items=[
             QuickReplyItem(action=PostbackAction(label="➕ 加入餐廳", data="menu_action=click_add", displayText="點擊了加入餐廳")),
             QuickReplyItem(action=PostbackAction(label="📋 我的口袋名單", data="menu_action=click_list&page=1", displayText="查看口袋名單")),
-            QuickReplyItem(action=PostbackAction(label="🎲 隨機推薦", data="menu_action=click_random", displayText="幫我隨機推薦一間餐廳"))
+            QuickReplyItem(action=PostbackAction(label="🎲 隨機推薦", data="menu_action=click_random", displayText="幫我隨機推薦一間餐廳")),
+            QuickReplyItem(action=PostbackAction(label="🏆 我的成就", data="menu_action=click_achievement", displayText="查看我的美食成就"))
         ]
     )
 
@@ -635,6 +677,53 @@ def handle_postback(event):
             carousel_template = CarouselTemplate(columns=[column])
             template_message = TemplateMessage(alt_text=f"今日推薦餐廳：{restaurant_name}", template=carousel_template)
             send_reply(event.reply_token, [template_message, TextMessage(text="今天就決定吃這家了嗎？😋")], menu_type='main')
+        return
+    
+    # 新增：處理點擊「🏆 我的成就」
+    elif menu_action == 'click_achievement':
+        # 1. 撈取目前統計數據
+        stats = get_user_achievement_stats(user_id)
+        added = stats['added']
+        visited = stats['visited']
+        deleted = stats['deleted']
+        
+        # 2. 輔助函式：用來產生精美的勳章與進度文字
+        def make_row(current, milestones, icons):
+            # milestones 傳入 [1, 3, 5] 或 [1, 5, 10]
+            # icons 傳入對應的表情符號
+            res = ""
+            for i, goal in enumerate(milestones):
+                if current >= goal:
+                    res += f"{icons[i]} "  # 已達成顯示勳章
+                else:
+                    res += "🔒 "  # 未達成顯示鎖頭
+            return res
+
+        # 3. 開始拼裝文字介面
+        ach_text = (
+            "🏆 【美食大師 - 成就進度面板】\n"
+            "---------------------------\n\n"
+            
+            f"🍽️ 【出發用餐】\n"
+            f"進度：{visited} 次\n"
+            f"獎勵：{make_row(visited, [1, 3, 5], ['🥉', '🥈', '🥇'])}\n"
+            f"🎯 目標：1次(🥉) / 3次(🥈) / 5次(🥇)\n\n"
+            
+            f"➕ 【開拓疆土】(新增餐廳)\n"
+            f"進度：{added} 間\n"
+            f"獎勵：{make_row(added, [1, 5, 10], ['🎖️', '🏅', '🏆'])}\n"
+            f"🎯 目標：1間(🎖️) / 5間(🏅) / 10間(🏆)\n\n"
+            
+            f"❌ 【斷捨離】(刪除餐廳)\n"
+            f"進度：{deleted} 次\n"
+            f"獎勵：{make_row(deleted, [1, 5, 10], ['🪓', '⚔️', '👑'])}\n"
+            f"🎯 目標：1次(🪓) / 5次(⚔️) / 10次(👑)\n\n"
+            
+            "---------------------------\n"
+            "繼續使用功能，解鎖更多隱藏勳章吧！✨"
+        )
+        
+        send_reply(event.reply_token, [TextMessage(text=ach_text)], menu_type='main')
         return
 
     # ================= 2. 處理 Template 的動作 =================
