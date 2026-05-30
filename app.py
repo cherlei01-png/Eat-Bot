@@ -437,6 +437,24 @@ def get_list_quick_reply(total_count, page=1):
     items.append(QuickReplyItem(action=PostbackAction(label="🚪 退出名單", data="menu_action=exit_list", displayText="退出名單模式")))
     return QuickReply(items=items)
 
+# 新增：直接消滅某個分類（一次性將所有餐廳移出該分類）
+def delete_entire_category(user_id, category_name):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            DELETE FROM restaurant_categories 
+            WHERE user_id = %s AND category = %s
+        ''', (user_id, category_name))
+        conn.commit()
+        return cursor.rowcount # 回傳總共影響（移出）了幾間餐廳
+    except Exception as e:
+        print(f"Delete entire category DB error: {e}")
+        return 0
+    finally:
+        cursor.close()
+        conn.close()
+
 
 # ==================== 輪播圖卡產生邏輯（修正安全編碼版） ====================
 # 💡 修改：傳入 current_cat 參數
@@ -639,20 +657,21 @@ def handle_postback(event):
         return
         
     elif menu_action == 'click_list':
-        # 💡 核心優化：不再直接吐出名單，而是先讓使用者選分類
         user_cats = get_user_all_categories(user_id)
         
-        # 組合 Quick Reply 按鈕
-        items = [QuickReplyItem(action=PostbackAction(label="🌟 全部餐廳", data="menu_action=show_cat_list&cat=全部&page=1", displayText="查看全部口袋名單"))]
-        for cat in user_cats[:12]: # LINE 限制 Quick Reply 最多 13 個按鈕
-            items.append(QuickReplyItem(action=PostbackAction(label=f"📂 {cat}", data=f"menu_action=show_cat_list&cat={urllib.parse.quote(cat)}&page=1", displayText=f"查看分類【{cat}】")))
+        # 💡 提供核心選擇：要看名單，還是要刪除分類？
+        items = [
+            QuickReplyItem(action=PostbackAction(label="🌟 查看：全部餐廳", data="menu_action=show_cat_list&cat=全部&page=1", displayText="查看全部口袋名單")),
+            QuickReplyItem(action=PostbackAction(label="🔥 進入：刪除分類模式", data="menu_action=manage_cat_menu", displayText="想要刪除某個分類"))
+        ]
         
-        items.append(QuickReplyItem(action=PostbackAction(label="🚪 返回主選單", data="menu_action=exit_list", displayText="返回主選單")))
+        # 列出前 11 個分類供使用者點擊查看
+        for cat in user_cats[:11]: 
+            items.append(QuickReplyItem(action=PostbackAction(label=f"📂 查看：{cat}", data=f"menu_action=show_cat_list&cat={urllib.parse.quote(cat)}&page=1", displayText=f"查看分類【{cat}】")))
         
         quick_reply_menu = QuickReply(items=items)
-        msg = TextMessage(text="請選擇你想查看的餐廳分類：", quick_reply=quick_reply_menu)
+        msg = TextMessage(text="請選擇你想查看的餐廳分類，或點擊進入刪除模式：", quick_reply=quick_reply_menu)
         
-        # 直接使用原生 Reply 傳送
         with ApiClient(configuration) as api_client:
             MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[msg]))
         return
@@ -904,6 +923,57 @@ def handle_postback(event):
         else:
             reply_text = f"❌ 移除失敗，或該餐廳原本就不在【{cat_name}】分類中。"
             
+        send_reply(event.reply_token, [TextMessage(text=reply_text)], menu_type='main')
+        return
+    
+    # 1. 顯示有哪些分類可以刪除
+    elif menu_action == 'manage_cat_menu':
+        user_cats = get_user_all_categories(user_id)
+        
+        if not user_cats:
+            send_reply(event.reply_token, [TextMessage(text="你目前還沒有建立任何自訂分類，沒東西可以刪除喔！")], menu_type='main')
+            return
+            
+        items = []
+        for cat in user_cats[:12]: # LINE 限制
+            items.append(QuickReplyItem(action=PostbackAction(label=f"🗑️ 刪除【{cat}】", data=f"action=ask_delete_cat&cat={urllib.parse.quote(cat)}", displayText=f"我想刪除整個【{cat}】分類")))
+        
+        items.append(QuickReplyItem(action=PostbackAction(label="🚪 返回", data="menu_action=click_list")))
+        
+        quick_reply_menu = QuickReply(items=items)
+        msg = TextMessage(text="🔥 【危險區域】請選擇你想「徹底刪除」的分類：\n(這會解除該分類下所有餐廳的綁定，但餐廳本體不會消失)", quick_reply=quick_reply_menu)
+        
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[msg]))
+        return
+
+    # 2. 點擊特定分類刪除後，跳出 ButtonsTemplate 二次確認
+    elif action == 'ask_delete_cat':
+        cat_name = urllib.parse.unquote(params.get('cat', ''))
+        
+        confirm_button = ButtonsTemplate(
+            title="⚠️ 警告：確認刪除整個分類",
+            text=f"確定要將分類【{cat_name}】徹底刪除嗎？裡面的餐廳將不再屬於此分類。(餐廳本身仍會保留在全部名單中)",
+            actions=[
+                PostbackAction(
+                    label="確認一鍵刪除", 
+                    data=f"action=delete_cat_confirm&cat={urllib.parse.quote(cat_name)}", 
+                    displayText=f"確認刪除分類 {cat_name}"
+                ),
+                PostbackAction(label="取消", data="action=cancel", displayText="取消操作")
+            ]
+        )
+        send_reply(event.reply_token, [TemplateMessage(alt_text="確認刪除分類", template=confirm_button)])
+        return
+
+    # 3. 執行資料庫批次刪除
+    elif action == 'delete_cat_confirm':
+        cat_name = urllib.parse.unquote(params.get('cat', ''))
+        
+        # 呼叫剛剛寫的批次刪除函數
+        affected_rows = delete_entire_category(user_id, cat_name)
+        
+        reply_text = f"✨ 刪除成功！分類【{cat_name}】已被徹底移除，共將 {affected_rows} 間餐廳移出該分類，釋出 1 個分類額度！"
         send_reply(event.reply_token, [TextMessage(text=reply_text)], menu_type='main')
         return
 
