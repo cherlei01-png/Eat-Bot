@@ -48,20 +48,20 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
-    # 1. 口袋名單表 (新增 map_url 欄位)
+    # 1. 口袋名單表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS pocket_list (
             user_id TEXT,
             restaurant_name TEXT,
+            map_url TEXT,
             PRIMARY KEY (user_id, restaurant_name)
         )
     ''')
-    # 💡 核心安全升級：檢查並動態為舊資料表加上 map_url 欄位，預設為空 (NULL)
     try:
         cursor.execute('ALTER TABLE pocket_list ADD COLUMN map_url TEXT;')
         conn.commit()
     except psycopg2.errors.DuplicateColumn:
-        conn.rollback() # 如果欄位已經存在，會噴錯，我們直接 rollback 跳過即可
+        conn.rollback()
 
     # 2. 使用者狀態表
     cursor.execute('''
@@ -70,7 +70,8 @@ def init_db():
             state TEXT
         )
     ''')
-    # 3. 標籤資料表
+    
+    # 3. 標籤資料表 (#開頭)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS restaurant_tags (
             user_id TEXT,
@@ -79,9 +80,99 @@ def init_db():
             PRIMARY KEY (user_id, restaurant_name, tag)
         )
     ''')
+
+    # 💡 新增 4. 分類資料表 (/開頭)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS restaurant_categories (
+            user_id TEXT,
+            restaurant_name TEXT,
+            category TEXT,
+            PRIMARY KEY (user_id, restaurant_name, category)
+        )
+    ''')
+
+    # 💡 新增 5. 用餐冷卻歷史紀錄表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_cooling_history (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT,
+            restaurant_name TEXT,
+            visited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
     conn.commit()
     cursor.close()
     conn.close()
+
+# 新增：寫入用餐歷史紀錄
+def add_to_cooling_history(user_id, restaurant_name):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            'INSERT INTO user_cooling_history (user_id, restaurant_name) VALUES (%s, %s)',
+            (user_id, restaurant_name)
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"Cooling history error: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+# 新增：動態取得使用者建立過的所有分類清單 (不重複)
+def get_user_all_categories(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('SELECT DISTINCT category FROM restaurant_categories WHERE user_id = %s', (user_id,))
+        rows = cursor.fetchall()
+        return [row[0] for row in rows]
+    except Exception:
+        return []
+    finally:
+        cursor.close()
+        conn.close()
+
+# 新增：寫入分類資料
+def add_restaurant_category(user_id, restaurant_name, category_name):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            INSERT INTO restaurant_categories (user_id, restaurant_name, category)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id, restaurant_name, category) DO NOTHING
+        ''', (user_id, restaurant_name, category_name))
+        conn.commit()
+    except Exception as e:
+        print(f"Category DB error: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+# 新增：根據特定分類篩選口袋名單
+def get_pocket_list_by_category(user_id, category=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        if not category or category == '全部':
+            cursor.execute('SELECT restaurant_name, map_url FROM pocket_list WHERE user_id = %s', (user_id,))
+        else:
+            cursor.execute('''
+                SELECT p.restaurant_name, p.map_url 
+                FROM pocket_list p
+                JOIN restaurant_categories c ON p.user_id = c.user_id AND p.restaurant_name = c.restaurant_name
+                WHERE p.user_id = %s AND c.category = %s
+            ''', (user_id, category))
+        rows = cursor.fetchall()
+        return [{'name': row[0], 'url': row[1]} for row in rows]
+    except Exception:
+        return []
+    finally:
+        cursor.close()
+        conn.close()
 
 def is_restaurant_exist(user_id, restaurant_name):
     conn = get_db_connection()
@@ -160,6 +251,7 @@ def get_user_pocket_list(user_id):
         conn.close()
 
 # 新增：從資料庫隨機抽取一間餐廳 (ORDER BY RANDOM)
+# 修改：隨機推薦抽出時，自動排除最近 5 次吃過的餐廳
 def get_random_restaurant(user_id):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -168,9 +260,16 @@ def get_random_restaurant(user_id):
             SELECT restaurant_name, map_url 
             FROM pocket_list 
             WHERE user_id = %s 
+              AND restaurant_name NOT IN (
+                  SELECT restaurant_name 
+                  FROM user_cooling_history 
+                  WHERE user_id = %s 
+                  ORDER BY visited_at DESC 
+                  LIMIT 5
+              )
             ORDER BY RANDOM() 
             LIMIT 1
-        ''', (user_id,))
+        ''', (user_id, user_id))
         row = cursor.fetchone()
         return {'name': row[0], 'url': row[1]} if row else None
     except Exception:
@@ -363,25 +462,35 @@ def handle_message(event):
         _, target_restaurant = current_state.split('|', 1)
         set_user_state(user_id, 'IDLE')
 
-        raw_input = user_message.replace('#', ' ')
-        input_tags = [t.strip() for t in raw_input.split() if t.strip()]
+        # 將輸入依照空白切開
+        tokens = user_message.split()
+        tags_to_add = []
+        categories_to_add = []
 
-        if not input_tags:
-            send_reply(event.reply_token, [TextMessage(text="未偵測到有效的標籤，操作已取消。")], menu_type='main')
+        for token in tokens:
+            if token.startswith('#'):
+                t_name = token[1:].strip()
+                if t_name: tags_to_add.append(t_name)
+            elif token.startswith('/'):
+                c_name = token[1:].strip()
+                if c_name: categories_to_add.append(c_name)
+
+        if not tags_to_add and not categories_to_add:
+            send_reply(event.reply_token, [TextMessage(text="未偵測到以 # 開頭的標籤或 / 開頭的分類，操作已取消。")], menu_type='main')
             return
 
-        tags_str = " ".join([f"#{t}" for t in input_tags])
-        encoded_tags = urllib.parse.quote(",".join(input_tags))
+        # 寫入資料庫
+        if tags_to_add:
+            add_restaurant_tags(user_id, target_restaurant, tags_to_add)
+        if categories_to_add:
+            for cat in categories_to_add:
+                add_restaurant_category(user_id, target_restaurant, cat)
 
-        buttons_template = ButtonsTemplate(
-            title="確認新增標籤",
-            text=f"要為「{target_restaurant}」加上標籤嗎？\n{tags_str}",
-            actions=[
-                PostbackAction(label="確認加入標籤", data=f"action=tag_confirm&name={urllib.parse.quote(target_restaurant)}&tags={encoded_tags}", displayText="確認新增標籤"),
-                PostbackAction(label="取消", data="action=cancel", displayText="取消操作")
-            ]
-        )
-        send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否加入標籤", template=buttons_template)])
+        summary = "✨ 設定成功！\n"
+        if tags_to_add: summary += f"🏷️ 標籤：{' '.join(['#'+t for t in tags_to_add])}\n"
+        if categories_to_add: summary += f"📂 分類：{' '.join(['/'+c for c in categories_to_add])}"
+
+        send_reply(event.reply_token, [TextMessage(text=summary)], menu_type='main')
         return
 
     # ------ 修改狀態 D：等待使用者輸入「經緯度座標」 ------
@@ -389,37 +498,24 @@ def handle_message(event):
         _, target_restaurant = current_state.split('|', 1)
         set_user_state(user_id, 'IDLE')
 
-        # 💡 正規表達式：允許 [正負號][數字][小數點] + [逗號] + [正負號][數字][小數點]
-        # 這樣可以完美匹配像 "25.0339, 121.5645" 或 "25.0339,121.5645" 這種乾淨的字串
+        # 💡 先把可能包含的 ( ) 括號拿掉，並將全形逗號換成半形
+        cleaned_message = user_message.replace('(', '').replace(')', '').replace('（', '').replace('）', '').replace('，', ',').strip()
+
+        # 正規表達式驗證乾淨的經緯度
         coord_pattern = r'^[-+]?([1-8]?\d(\.\d+)?|90(\.0+)?),\s*[-+]?(180(\.0+)?|((1[0-7]\d)|([1-9]?\d))(\.\d+)?)$'
         
-        # 先把全形逗號換成半形逗號，拿掉前後空格
-        cleaned_message = user_message.replace('，', ',').strip()
-
         if not re.match(coord_pattern, cleaned_message):
-            error_text = (
-                "⚠️ 格式錯誤，操作已取消！\n\n"
-                "請確保輸入的是乾淨的經緯度座標數字。\n"
-                "正確格式範例：\n"
-                "25.0339, 121.5645"
-            )
+            error_text = "⚠️ 格式錯誤！請確保輸入的是正確的經緯度座標數字（帶有括號也可以哦）。\n範例：(25.0339, 121.5645)"
             send_reply(event.reply_token, [TextMessage(text=error_text)], menu_type='main')
             return
 
-        # 格式完全正確，直接將拼好的 Google Maps 導航連結準備好
-        # 用經緯度導航的官方萬用格式：https://www.google.com/maps/search/?api=1&query=緯度,經度
-        target_url = cleaned_message
+        target_url = cleaned_message 
 
-        # 彈出確認視窗
         buttons_template = ButtonsTemplate(
             title="確認位置設定",
             text=f"已成功識別座標！要為「{target_restaurant}」綁定這個地圖位置嗎？",
             actions=[
-                PostbackAction(
-                    label="確認設定位置", 
-                    data=f"action=url_confirm&name={urllib.parse.quote(target_restaurant)}&url={urllib.parse.quote(target_url)}", 
-                    displayText="確認設定位置"
-                ),
+                PostbackAction(label="確認設定位置", data=f"action=url_confirm&name={urllib.parse.quote(target_restaurant)}&url={urllib.parse.quote(target_url)}", displayText="確認設定位置"),
                 PostbackAction(label="取消", data="action=cancel", displayText="取消操作")
             ]
         )
@@ -455,14 +551,48 @@ def handle_postback(event):
         return
         
     elif menu_action == 'click_list':
+        # 💡 核心優化：不再直接吐出名單，而是先讓使用者選分類
+        user_cats = get_user_all_categories(user_id)
+        
+        # 組合 Quick Reply 按鈕
+        items = [QuickReplyItem(action=PostbackAction(label="🌟 全部餐廳", data="menu_action=show_cat_list&cat=全部&page=1", displayText="查看全部口袋名單"))]
+        for cat in user_cats[:12]: # LINE 限制 Quick Reply 最多 13 個按鈕
+            items.append(QuickReplyItem(action=PostbackAction(label=f"📂 {cat}", data=f"menu_action=show_cat_list&cat={urllib.parse.quote(cat)}&page=1", displayText=f"查看分類【{cat}】")))
+        
+        items.append(QuickReplyItem(action=PostbackAction(label="🚪 返回主選單", data="menu_action=exit_list", displayText="返回主選單")))
+        
+        quick_reply_menu = QuickReply(items=items)
+        msg = TextMessage(text="請選擇你想查看的餐廳分類：", quick_reply=quick_reply_menu)
+        
+        # 直接使用原生 Reply 傳送
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[msg]))
+        return
+
+    elif menu_action == 'show_cat_list':
+        target_cat = urllib.parse.unquote(params.get('cat', '全部'))
         page = int(params.get('page', 1))
-        user_list = get_user_pocket_list(user_id)
+        
+        user_list = get_pocket_list_by_category(user_id, target_cat)
         if not user_list:
-            send_reply(event.reply_token, [TextMessage(text="目前的口袋名單空空如也喔！快去加入餐廳吧。")], menu_type='main')
+            send_reply(event.reply_token, [TextMessage(text=f"分類【{target_cat}】目前沒有餐廳喔！")], menu_type='main')
         else:
             carousel_msg = get_carousel_list_message(user_id, user_list, page=page)
-            hint_msg = TextMessage(text=f"目前在第 {page} 頁，可繼續點選下方選單：")
-            send_reply(event.reply_token, [carousel_msg, hint_msg], menu_type='list', total_count=len(user_list), page=page)
+            # 為了讓分頁能記住目前在選哪個分類，稍微調整 QuickReply 的傳值
+            hint_msg = TextMessage(text=f"📂 當前分類：{target_cat} (第 {page} 頁)")
+            
+            # 動態覆寫下一頁的 QuickReply
+            page_size = 10
+            has_prev = page > 1
+            has_next = (page * page_size) < len(user_list)
+            qr_items = []
+            if has_prev: qr_items.append(QuickReplyItem(action=PostbackAction(label="⬅️ 上一頁", data=f"menu_action=show_cat_list&cat={urllib.parse.quote(target_cat)}&page={page - 1}")))
+            if has_next: qr_items.append(QuickReplyItem(action=PostbackAction(label="➡️ 下一頁", data=f"menu_action=show_cat_list&cat={urllib.parse.quote(target_cat)}&page={page + 1}")))
+            qr_items.append(QuickReplyItem(action=PostbackAction(label="🚪 換分類", data="menu_action=click_list")))
+            hint_msg.quick_reply = QuickReply(items=qr_items)
+            
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).reply_message(ReplyMessageRequest(reply_token=event.reply_token, messages=[carousel_msg, hint_msg]))
         return
 
     elif menu_action == 'exit_list':
@@ -474,15 +604,12 @@ def handle_postback(event):
         res_data = get_random_restaurant(user_id)
         
         if not res_data:
-            send_reply(event.reply_token, [TextMessage(text="你的口袋名單目前沒有任何餐廳，抽不到東西喔！")], menu_type='main')
+            send_reply(event.reply_token, [TextMessage(text="名單內沒有餐廳，或符合冷卻條件的餐廳不夠抽喔！")], menu_type='main')
         else:
             restaurant_name = res_data['name']  
-            db_url = res_data['url'] # 從資料庫撈出來的網址(可能為 None)
+            db_url = res_data['url']
             
-            # 💡 核心智慧判斷：有綁定座標網址就用它，沒有的話就動態退化成名稱自動搜尋
-            # 💡 找到隨機推薦裡拼網址的地方，改成跟上面一樣的官方標準格式：
             if db_url:
-                # 如果有座標，先清乾淨可能殘留的舊網址開頭
                 clean_coord = db_url.replace("https://www.google.com/maps/search/?api=1&query=", "").strip()
                 maps_url = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(clean_coord)}"
                 nav_label = "🗺️ 開始導航 (精準座標)"
@@ -493,23 +620,20 @@ def handle_postback(event):
             
             column = CarouselColumn(
                 title=f"🎲 今日推薦：{restaurant_name[:30]}",
-                text="為您隨機挑選的美味，點擊下方開始導航吧！",
+                text="為您隨機挑選的美味，點擊下方出發吧！",
                 actions=[
                     URIAction(label=nav_label, uri=maps_url),
+                    # 💡 核心變更：移除刪除，改為前往用餐
                     PostbackAction(
-                        label="❌ 刪除餐廳",
-                        data=f"action=delete_confirm&name={urllib.parse.quote(restaurant_name)}",
-                        displayText=f"確認刪除 {restaurant_name}"
+                        label="🍽️ 前往用餐 (5次內不重複)",
+                        data=f"action=go_eat&name={urllib.parse.quote(restaurant_name)}",
+                        displayText=f"決定去吃 {restaurant_name} 囉！"
                     )
                 ]
             )
             
             carousel_template = CarouselTemplate(columns=[column])
-            template_message = TemplateMessage(
-                alt_text=f"今日推薦餐廳：{restaurant_name}",
-                template=carousel_template
-            )
-            
+            template_message = TemplateMessage(alt_text=f"今日推薦餐廳：{restaurant_name}", template=carousel_template)
             send_reply(event.reply_token, [template_message, TextMessage(text="今天就決定吃這家了嗎？😋")], menu_type='main')
         return
 
@@ -594,6 +718,13 @@ def handle_postback(event):
     elif action == 'delete_cancel':
         send_reply(event.reply_token, [TextMessage(text="好的，已取消刪除，保留餐廳。")], menu_type='main')
 
+    elif action == 'go_eat':
+        restaurant_name = urllib.parse.unquote(params.get('name', ''))
+        # 寫入歷史紀錄，啟動 5 次排除冷卻機制
+        add_to_cooling_history(user_id, restaurant_name)
+        reply_text = f"👌 已幫你記錄！祝你用餐愉快！「{restaurant_name}」在接下來的 5 次抽籤中將不會再被抽到。"
+        send_reply(event.reply_token, [TextMessage(text=reply_text)], menu_type='main')
+        return
 
 def send_reply(reply_token, messages, menu_type=None, total_count=0, page=1):
     if messages and isinstance(messages[-1], TextMessage):
