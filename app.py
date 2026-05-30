@@ -398,7 +398,7 @@ def get_carousel_list_message(user_id, user_list, page=1):
 
         # 固定必有的兩個按鈕
         card_actions = [
-            PostbackAction(label="🏷️ 加入標籤", data=f"action=click_add_tag&name={urllib.parse.quote(name)}", displayText=f"想為 {name} 新增標籤"),
+            PostbackAction(label="🏷️ 加入#標籤 /分類", data=f"action=click_add_tag&name={urllib.parse.quote(name)}", displayText=f"想為 {name} 新增標籤"),
             PostbackAction(label="❌ 刪除這間餐廳", data=f"action=ask_delete&name={urllib.parse.quote(name)}", displayText=f"想要移除 {name}")
         ]
 
@@ -625,7 +625,7 @@ def handle_postback(event):
                     URIAction(label=nav_label, uri=maps_url),
                     # 💡 核心變更：移除刪除，改為前往用餐
                     PostbackAction(
-                        label="🍽️ 前往用餐 (5次內不重複)",
+                        label="🍽️ 前往用餐 (有冷卻)",
                         data=f"action=go_eat&name={urllib.parse.quote(restaurant_name)}",
                         displayText=f"決定去吃 {restaurant_name} 囉！"
                     )
@@ -653,7 +653,17 @@ def handle_postback(event):
     elif action == 'click_add_tag':
         restaurant_name = urllib.parse.unquote(params.get('name', ''))
         set_user_state(user_id, f"WAIT_FOR_TAG|{restaurant_name}")
-        send_reply(event.reply_token, [TextMessage(text=f"請輸入要為「{restaurant_name}」新增的標籤：\n(多個標籤請用空格分隔，例：#好吃 #拉麵)")])
+        
+        # 🎯 優化提示訊息：增加 /分類 的詳細說明與範例
+        guide_text = (
+            f"🏷️ 正在為「{restaurant_name}」設定標籤與分類\n\n"
+            f"請直接輸入你想設定的內容，多個項目請用「空格」分開：\n\n"
+            f"🔸 # 開頭會變成【圖卡標籤】（單純展示用）\n"
+            f"🔹 / 開頭會變成【清單分類】（主選單篩選用）\n\n"
+            f"💡 範例輸入（可複製修改）：\n"
+            f"#美味 #有冷氣 /鍋貼 /晚餐"
+        )
+        send_reply(event.reply_token, [TextMessage(text=guide_text)])
 
     elif action == 'tag_confirm':
         restaurant_name = urllib.parse.unquote(params.get('name', ''))
@@ -722,7 +732,7 @@ def handle_postback(event):
         restaurant_name = urllib.parse.unquote(params.get('name', ''))
         # 寫入歷史紀錄，啟動 5 次排除冷卻機制
         add_to_cooling_history(user_id, restaurant_name)
-        reply_text = f"👌 已幫你記錄！祝你用餐愉快！「{restaurant_name}」在接下來的 5 次抽籤中將不會再被抽到。"
+        reply_text = f"👌 已幫你記錄！祝你用餐愉快！「{restaurant_name}」將進入冷卻"
         send_reply(event.reply_token, [TextMessage(text=reply_text)], menu_type='main')
         return
 
