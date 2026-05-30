@@ -30,6 +30,7 @@ from linebot.v3.webhooks import (
 import urllib.parse
 import psycopg2
 import os
+import re
 
 app = Flask(__name__)
 DB_URL = os.environ.get('POSTGRES_URL') 
@@ -371,30 +372,46 @@ def handle_message(event):
         send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否加入標籤", template=buttons_template)])
         return
 
-    # ------ 新增狀態 D：等待使用者輸入「Google Map 連結」 ------
+    # ------ 修改狀態 D：等待使用者輸入「經緯度座標」 ------
     elif current_state.startswith('WAIT_FOR_URL|'):
         _, target_restaurant = current_state.split('|', 1)
         set_user_state(user_id, 'IDLE')
 
-        # 防呆驗證：必須要是 http 開頭的連結
-        if not (user_message.startswith('http://') or user_message.startswith('https://')):
-            send_reply(event.reply_token, [TextMessage(text="格式錯誤！請輸入正確的 Google Maps 網址連結，操作已取消。")], menu_type='main')
+        # 💡 正規表達式：允許 [正負號][數字][小數點] + [逗號] + [正負號][數字][小數點]
+        # 這樣可以完美匹配像 "25.0339, 121.5645" 或 "25.0339,121.5645" 這種乾淨的字串
+        coord_pattern = r'^[-+]?([1-8]?\d(\.\d+)?|90(\.0+)?),\s*[-+]?(180(\.0+)?|((1[0-7]\d)|([1-9]?\d))(\.\d+)?)$'
+        
+        # 先把全形逗號換成半形逗號，拿掉前後空格
+        cleaned_message = user_message.replace('，', ',').strip()
+
+        if not re.match(coord_pattern, cleaned_message):
+            error_text = (
+                "⚠️ 格式錯誤，操作已取消！\n\n"
+                "請確保輸入的是乾淨的經緯度座標數字。\n"
+                "正確格式範例：\n"
+                "25.0339, 121.5645"
+            )
+            send_reply(event.reply_token, [TextMessage(text=error_text)], menu_type='main')
             return
+
+        # 格式完全正確，直接將拼好的 Google Maps 導航連結準備好
+        # 用經緯度導航的官方萬用格式：https://www.google.com/maps/search/?api=1&query=緯度,經度
+        target_url = f"https://www.google.com/maps/search/?api=1&query={cleaned_message}"
 
         # 彈出確認視窗
         buttons_template = ButtonsTemplate(
-            title="確認連結設定",
-            text=f"要為「{target_restaurant}」設定此地圖連結嗎？",
+            title="確認位置設定",
+            text=f"已成功識別座標！要為「{target_restaurant}」綁定這個地圖位置嗎？",
             actions=[
                 PostbackAction(
-                    label="確認設定連結", 
-                    data=f"action=url_confirm&name={urllib.parse.quote(target_restaurant)}&url={urllib.parse.quote(user_message)}", 
-                    displayText="確認設定連結"
+                    label="確認設定位置", 
+                    data=f"action=url_confirm&name={urllib.parse.quote(target_restaurant)}&url={urllib.parse.quote(target_url)}", 
+                    displayText="確認設定位置"
                 ),
                 PostbackAction(label="取消", data="action=cancel", displayText="取消操作")
             ]
         )
-        send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否綁定地圖網址", template=buttons_template)])
+        send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否綁定地圖位置", template=buttons_template)])
         return
 
     # ------ 一般狀態 (IDLE) 底下的關鍵字相容 ------
@@ -440,28 +457,30 @@ def handle_postback(event):
         send_reply(event.reply_token, [TextMessage(text="已退出名單模式，回到主選單。")], menu_type='main')
         return
 
-    # 修正後：處理主選單點擊「🎲 隨機推薦」
+    # 修改後：處理主選單點擊「🎲 隨機推薦」
     elif menu_action == 'click_random':
-        # 1. 從資料庫隨機抽出一間餐廳 (此函數回傳的是字典)
         res_data = get_random_restaurant(user_id)
         
         if not res_data:
-            # 💡 修正點：將 include_menu=True 改為正確的 menu_type='main'
             send_reply(event.reply_token, [TextMessage(text="你的口袋名單目前沒有任何餐廳，抽不到東西喔！")], menu_type='main')
         else:
-            # 💡 修正點：從字典中用 key 取出餐廳名稱
             restaurant_name = res_data['name']  
+            db_url = res_data['url'] # 從資料庫撈出來的網址(可能為 None)
             
-            # 2. 自動拼出 Google Maps 模糊搜尋的萬用網址
-            encoded_name = urllib.parse.quote(restaurant_name)
-            maps_url = f"https://www.google.com/maps/search/?api=1&query={encoded_name}"
+            # 💡 核心智慧判斷：有綁定座標網址就用它，沒有的話就動態退化成名稱自動搜尋
+            if db_url:
+                maps_url = db_url
+                nav_label = "🗺️ 開始導航 (精準座標)"
+            else:
+                encoded_name = urllib.parse.quote(restaurant_name)
+                maps_url = f"https://www.google.com/maps/search/?api=1&query={encoded_name}"
+                nav_label = "🗺️ 開始導航 (名稱搜尋)"
             
-            # 3. 使用 CarouselColumn 與 TemplateMessage 封裝
             column = CarouselColumn(
                 title=f"🎲 今日推薦：{restaurant_name[:30]}",
                 text="為您隨機挑選的美味，點擊下方開始導航吧！",
                 actions=[
-                    URIAction(label="🗺️ 開始導航 (自動搜尋)", uri=maps_url),
+                    URIAction(label=nav_label, uri=maps_url),
                     PostbackAction(
                         label="❌ 刪除餐廳",
                         data=f"action=delete_confirm&name={urllib.parse.quote(restaurant_name)}",
@@ -476,7 +495,6 @@ def handle_postback(event):
                 template=carousel_template
             )
             
-            # 💡 修正點：將 include_menu=True 改為正確的 menu_type='main'，讓主選單能附在文字訊息後面
             send_reply(event.reply_token, [template_message, TextMessage(text="今天就決定吃這家了嗎？😋")], menu_type='main')
         return
 
@@ -510,11 +528,20 @@ def handle_postback(event):
             reply_text = "新增標籤時發生系統錯誤。"
         send_reply(event.reply_token, [TextMessage(text=reply_text)], menu_type='main')
 
-    # 新增：點擊圖卡上的「📍 加入地點」
+    # 修改：點擊圖卡上的「📍 加入地點」
     elif action == 'click_add_url':
         restaurant_name = urllib.parse.unquote(params.get('name', ''))
         set_user_state(user_id, f"WAIT_FOR_URL|{restaurant_name}")
-        send_reply(event.reply_token, [TextMessage(text=f"請複製並貼上「{restaurant_name}」的 Google Maps 網址連結：")])
+        
+        guide_text = (
+            f"📌 請輸入「{restaurant_name}」的經緯度座標：\n\n"
+            f"💡 【手機查詢小技巧】\n"
+            f"1️⃣ 打開 Google 地圖，在該餐廳的位置「長按」放下一支紅針。\n"
+            f"2️⃣ 螢幕下方彈出的面板就會出現一串數字（例：25.0339, 121.5645）。\n"
+            f"3️⃣ 直接點擊或長按那串數字進行複製，並「單獨貼回來」這裡就可以囉！"
+        )
+        send_reply(event.reply_token, [TextMessage(text=guide_text)])
+        return
 
     # 新增：處理確認寫入 URL 的資料庫更新動作
     elif action == 'url_confirm':
