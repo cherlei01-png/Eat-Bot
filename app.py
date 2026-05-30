@@ -16,6 +16,7 @@ from linebot.v3.messaging import (
     CarouselTemplate,
     CarouselColumn,
     PostbackAction,
+    URIAction,
     TextMessage,
     QuickReply,
     QuickReplyItem
@@ -46,6 +47,7 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
+    # 1. 口袋名單表 (新增 map_url 欄位)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS pocket_list (
             user_id TEXT,
@@ -53,12 +55,21 @@ def init_db():
             PRIMARY KEY (user_id, restaurant_name)
         )
     ''')
+    # 💡 核心安全升級：檢查並動態為舊資料表加上 map_url 欄位，預設為空 (NULL)
+    try:
+        cursor.execute('ALTER TABLE pocket_list ADD COLUMN map_url TEXT;')
+        conn.commit()
+    except psycopg2.errors.DuplicateColumn:
+        conn.rollback() # 如果欄位已經存在，會噴錯，我們直接 rollback 跳過即可
+
+    # 2. 使用者狀態表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS user_state (
             user_id TEXT PRIMARY KEY,
             state TEXT
         )
     ''')
+    # 3. 標籤資料表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS restaurant_tags (
             user_id TEXT,
@@ -102,6 +113,25 @@ def add_restaurant(user_id, restaurant_name):
         conn.close()
     return success
 
+# 新增：更新餐廳的 Google Maps 地圖連結
+def update_restaurant_url(user_id, restaurant_name, map_url):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            UPDATE pocket_list 
+            SET map_url = %s 
+            WHERE user_id = %s AND restaurant_name = %s
+        ''', (map_url, user_id, restaurant_name))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"URL Update Error: {e}")
+        return False
+    finally:
+        cursor.close()
+        conn.close()
+
 def delete_restaurant(user_id, restaurant_name):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -113,15 +143,37 @@ def delete_restaurant(user_id, restaurant_name):
     conn.close()
     return changes > 0
 
+# 修改：除了撈出名字，也要一併撈出 map_url
 def get_user_pocket_list(user_id):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute('SELECT restaurant_name FROM pocket_list WHERE user_id = %s', (user_id,))
+        cursor.execute('SELECT restaurant_name, map_url FROM pocket_list WHERE user_id = %s', (user_id,))
         rows = cursor.fetchall()
-        return [row[0] for row in rows]
+        # 回傳格式為陣列包字典： [{'name': '...', 'url': '...'}, ...]
+        return [{'name': row[0], 'url': row[1]} for row in rows]
     except Exception:
         return []
+    finally:
+        cursor.close()
+        conn.close()
+
+# 新增：從資料庫隨機抽取一間餐廳 (ORDER BY RANDOM)
+def get_random_restaurant(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            SELECT restaurant_name, map_url 
+            FROM pocket_list 
+            WHERE user_id = %s 
+            ORDER BY RANDOM() 
+            LIMIT 1
+        ''', (user_id,))
+        row = cursor.fetchone()
+        return {'name': row[0], 'url': row[1]} if row else None
+    except Exception:
+        return None
     finally:
         cursor.close()
         conn.close()
@@ -202,67 +254,68 @@ def handle_follow(event):
 
 
 def get_main_quick_reply():
-    """首頁主選單：加入與查看"""
+    """修改：主選單新增「🎲 隨機推薦」功能"""
     return QuickReply(
         items=[
             QuickReplyItem(action=PostbackAction(label="➕ 加入餐廳", data="menu_action=click_add", displayText="點擊了加入餐廳")),
-            QuickReplyItem(action=PostbackAction(label="📋 我的口袋名單", data="menu_action=click_list&page=1", displayText="查看口袋名單"))
+            QuickReplyItem(action=PostbackAction(label="📋 我的口袋名單", data="menu_action=click_list&page=1", displayText="查看口袋名單")),
+            QuickReplyItem(action=PostbackAction(label="🎲 隨機推薦", data="menu_action=click_random", displayText="幫我隨機推薦一間餐廳"))
         ]
     )
 
-# 新增：動態產生名單專用的 Quick Reply (包含上/下一頁和退出)
 def get_list_quick_reply(total_count, page=1):
-    """根據當前頁數與餐廳總數，動態長出上/下一頁與退出按鈕"""
-    page_size = 10  # 口袋名單改為一頁顯示滿 10 個餐廳
+    page_size = 10
     has_prev = page > 1
     has_next = (page * page_size) < total_count
 
     items = []
-    
-    # 如果有前一頁，加入上一頁按鈕
     if has_prev:
-        items.append(QuickReplyItem(
-            action=PostbackAction(label="⬅️ 上一頁", data=f"menu_action=click_list&page={page - 1}", displayText="查看上一頁名單")
-        ))
-        
-    # 如果有下一頁，加入下一頁按鈕
+        items.append(QuickReplyItem(action=PostbackAction(label="⬅️ 上一頁", data=f"menu_action=click_list&page={page - 1}", displayText="查看上一頁名單")))
     if has_next:
-        items.append(QuickReplyItem(
-            action=PostbackAction(label="➡️ 下一頁", data=f"menu_action=click_list&page={page + 1}", displayText="查看下一頁名單")
-        ))
-        
-    # 固定加入退出名單按鈕
-    items.append(QuickReplyItem(
-        action=PostbackAction(label="🚪 退出名單", data="menu_action=exit_list", displayText="退出名單模式")
-    ))
+        items.append(QuickReplyItem(action=PostbackAction(label="➡️ 下一頁", data=f"menu_action=click_list&page={page + 1}", displayText="查看下一頁名單")))
     
+    items.append(QuickReplyItem(action=PostbackAction(label="🚪 退出名單", data="menu_action=exit_list", displayText="退出名單模式")))
     return QuickReply(items=items)
 
 
 # ==================== 輪播圖卡產生邏輯 ====================
 def get_carousel_list_message(user_id, user_list, page=1):
-    """將餐廳清單轉換為 Carousel Template (單純顯示餐廳，分頁移至 Quick Reply)"""
+    """修改點：按鈕動態切換（有網址開啟地圖，沒網址加入地點）"""
     total_count = len(user_list)
-    page_size = 10  # 既然分頁按鈕移到下方了，這裡一張圖卡就直接塞滿 10 間餐廳
+    page_size = 10
     
     start_idx = (page - 1) * page_size
     end_idx = start_idx + page_size
     current_page_items = user_list[start_idx:end_idx]
 
     columns = []
-    for idx, name in enumerate(current_page_items, start=start_idx + 1):
+    for idx, res_data in enumerate(current_page_items, start=start_idx + 1):
+        name = res_data['name']
+        url = res_data['url']
+        
         tags = get_restaurant_tags(user_id, name)
         tag_text = " ".join([f"#{t}" for t in tags]) if tags else "暫無標籤"
         display_title = name[:40]
+
+        # 核心優化：一個卡片最多放 3 個按鈕，我們先放固定的刪除與標籤
+        card_actions = [
+            PostbackAction(label="🏷️ 加入標籤", data=f"action=click_add_tag&name={urllib.parse.quote(name)}", displayText=f"想為 {name} 新增標籤"),
+            PostbackAction(label="❌ 刪除這間餐廳", data=f"action=ask_delete&name={urllib.parse.quote(name)}", displayText=f"想要移除 {name}")
+        ]
+
+        # 核心優化：根據 url 是否存在，動態塞入第 3 個按鈕
+        if url:
+            # 有網址，直接放 URIAction，點擊後手機會直接打開 Google 地圖
+            card_actions.insert(0, URIAction(label="🌐 開啟地圖", uri=url))
+        else:
+            # 沒網址，引導去輸入地點網址
+            card_actions.insert(0, PostbackAction(label="📍 加入地點", data=f"action=click_add_url&name={urllib.parse.quote(name)}", displayText=f"為 {name} 設定地點"))
 
         columns.append(
             CarouselColumn(
                 title=display_title,
                 text=f"{tag_text}\n({idx}/{total_count})",
-                actions=[
-                    PostbackAction(label="🏷️ 加入標籤", data=f"action=click_add_tag&name={urllib.parse.quote(name)}", displayText=f"想為 {name} 新增標籤"),
-                    PostbackAction(label="❌ 刪除這間餐廳", data=f"action=ask_delete&name={urllib.parse.quote(name)}", displayText=f"想要移除 {name}")
-                ]
+                actions=card_actions
             )
         )
 
@@ -318,6 +371,32 @@ def handle_message(event):
         send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否加入標籤", template=buttons_template)])
         return
 
+    # ------ 新增狀態 D：等待使用者輸入「Google Map 連結」 ------
+    elif current_state.startswith('WAIT_FOR_URL|'):
+        _, target_restaurant = current_state.split('|', 1)
+        set_user_state(user_id, 'IDLE')
+
+        # 防呆驗證：必須要是 http 開頭的連結
+        if not (user_message.startswith('http://') or user_message.startswith('https://')):
+            send_reply(event.reply_token, [TextMessage(text="格式錯誤！請輸入正確的 Google Maps 網址連結，操作已取消。")], menu_type='main')
+            return
+
+        # 彈出確認視窗
+        buttons_template = ButtonsTemplate(
+            title="確認連結設定",
+            text=f"要為「{target_restaurant}」設定此地圖連結嗎？",
+            actions=[
+                PostbackAction(
+                    label="確認設定連結", 
+                    data=f"action=url_confirm&name={urllib.parse.quote(target_restaurant)}&url={urllib.parse.quote(user_message)}", 
+                    displayText="確認設定連結"
+                ),
+                PostbackAction(label="取消", data="action=cancel", displayText="取消操作")
+            ]
+        )
+        send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否綁定地圖網址", template=buttons_template)])
+        return
+
     # ------ 一般狀態 (IDLE) 底下的關鍵字相容 ------
     if user_message == '我的口袋名單':
         user_list = get_user_pocket_list(user_id)
@@ -326,7 +405,6 @@ def handle_message(event):
         else:
             carousel_msg = get_carousel_list_message(user_id, user_list, page=1)
             hint_msg = TextMessage(text="已進入名單模式，您可以使用下方選單切換頁面或退出：")
-            # 調整：傳入自訂參數，帶有名單專屬的選單
             send_reply(event.reply_token, [carousel_msg, hint_msg], menu_type='list', total_count=len(user_list), page=1)
     else:
         send_reply(event.reply_token, [TextMessage(text="請點選下方選單來操作喔！")], menu_type='main')
@@ -341,7 +419,7 @@ def handle_postback(event):
     menu_action = params.get('menu_action')
     action = params.get('action')
     
-    # ================= 1. 處理 Quick Reply 與分頁導向的選單動作 =================
+    # ================= 1. 處理 Quick Reply 與選單動作 =================
     if menu_action == 'click_add':
         set_user_state(user_id, 'WAIT_FOR_ADD')
         send_reply(event.reply_token, [TextMessage(text="請直接輸入你想加入的餐廳名稱：")])
@@ -351,17 +429,42 @@ def handle_postback(event):
         page = int(params.get('page', 1))
         user_list = get_user_pocket_list(user_id)
         if not user_list:
-            reply_text = "目前的口袋名單空空如也喔！快去加入餐廳吧。"
-            send_reply(event.reply_token, [TextMessage(text=reply_text)], menu_type='main')
+            send_reply(event.reply_token, [TextMessage(text="目前的口袋名單空空如也喔！快去加入餐廳吧。")], menu_type='main')
         else:
             carousel_msg = get_carousel_list_message(user_id, user_list, page=page)
             hint_msg = TextMessage(text=f"目前在第 {page} 頁，可繼續點選下方選單：")
             send_reply(event.reply_token, [carousel_msg, hint_msg], menu_type='list', total_count=len(user_list), page=page)
         return
 
-    # 新增：處理退出名單模式，回歸主選單
     elif menu_action == 'exit_list':
         send_reply(event.reply_token, [TextMessage(text="已退出名單模式，回到主選單。")], menu_type='main')
+        return
+
+    # 新增：處理主選單點擊「🎲 隨機推薦」
+    elif menu_action == 'click_random':
+        lucky_restaurant = get_random_restaurant(user_id)
+        if not lucky_restaurant:
+            send_reply(event.reply_token, [TextMessage(text="你的口袋名單目前沒有任何餐廳，抽不到東西喔！")], menu_type='main')
+        else:
+            name = lucky_restaurant['name']
+            url = lucky_restaurant['url']
+            
+            tags = get_restaurant_tags(user_id, name)
+            tag_str = " ".join([f"#{t}" for t in tags]) if tags else ""
+            
+            main_text = f"🎲 今天的推薦餐廳是：\n\n✨【 {name} 】✨\n{tag_str}".strip()
+            
+            if url:
+                # 如果這家餐廳有綁定網址，就用 ButtonsTemplate 漂亮地秀出地圖按鈕
+                buttons_template = ButtonsTemplate(
+                    title="為您推薦",
+                    text=main_text[:160], # 確保不超過 LINE 內文限制
+                    actions=[URIAction(label="🗺️ 一鍵導航 (開啟地圖)", uri=url)]
+                )
+                send_reply(event.reply_token, [TemplateMessage(alt_text="今日隨機推薦餐廳", template=buttons_template)], menu_type='main')
+            else:
+                # 沒網址就單純回覆文字
+                send_reply(event.reply_token, [TextMessage(text=main_text)], menu_type='main')
         return
 
     # ================= 2. 處理 Template 的動作 =================
@@ -394,6 +497,24 @@ def handle_postback(event):
             reply_text = "新增標籤時發生系統錯誤。"
         send_reply(event.reply_token, [TextMessage(text=reply_text)], menu_type='main')
 
+    # 新增：點擊圖卡上的「📍 加入地點」
+    elif action == 'click_add_url':
+        restaurant_name = urllib.parse.unquote(params.get('name', ''))
+        set_user_state(user_id, f"WAIT_FOR_URL|{restaurant_name}")
+        send_reply(event.reply_token, [TextMessage(text=f"請複製並貼上「{restaurant_name}」的 Google Maps 網址連結：")])
+
+    # 新增：處理確認寫入 URL 的資料庫更新動作
+    elif action == 'url_confirm':
+        restaurant_name = urllib.parse.unquote(params.get('name', ''))
+        target_url = urllib.parse.unquote(params.get('url', ''))
+        
+        success = update_restaurant_url(user_id, restaurant_name, target_url)
+        if success:
+            reply_text = f"成功為「{restaurant_name}」綁定地圖連結！✨\n之後查看名單就可以一鍵導航囉。"
+        else:
+            reply_text = "綁定連結時發生系統錯誤。"
+        send_reply(event.reply_token, [TextMessage(text=reply_text)], menu_type='main')
+
     elif action == 'ask_delete':
         restaurant_name = urllib.parse.unquote(params.get('name', ''))
         buttons_template = ButtonsTemplate(
@@ -420,7 +541,6 @@ def handle_postback(event):
 
 
 def send_reply(reply_token, messages, menu_type=None, total_count=0, page=1):
-    """重構發送邏輯：依據 menu_type 決定附加哪一種 Quick Reply 選單"""
     if messages and isinstance(messages[-1], TextMessage):
         if menu_type == 'main':
             messages[-1].quick_reply = get_main_quick_reply()
