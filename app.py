@@ -13,6 +13,8 @@ from linebot.v3.messaging import (
     ReplyMessageRequest,
     TemplateMessage,
     ButtonsTemplate,
+    CarouselTemplate,      # 新增
+    CarouselColumn,        # 新增
     PostbackAction,
     TextMessage,
     QuickReply,
@@ -29,32 +31,21 @@ import psycopg2
 import os
 
 app = Flask(__name__)
-# 直接讀取雲端連線字串
 DB_URL = os.environ.get('POSTGRES_URL') 
 
 configuration = Configuration(access_token=os.getenv('CHANNEL_ACCESS_TOKEN'))
 line_handler = WebhookHandler(os.getenv('CHANNEL_SECRET'))
 
-
-# 當你在 Vercel 點選 Neon 整合後，Vercel 會自動把連線字串注入到環境變數 'POSTGRES_URL' 中
-
 # ==================== Neon PostgreSQL 資料庫操作邏輯 ====================
 
 def get_db_connection():
-    """建立並回傳 Neon 雲端資料庫的連線"""
-    # 這裡加入防禦，萬一本機測試沒設定環境變數，會給出明確提示
     if not DB_URL:
-        raise ValueError("環境變數 POSTGRES_URL 未設定！請確認 Vercel 整合或本機 .env 設定。")
-    
-    # Neon 的連線字串開頭可能是 postgres://，psycopg2 完美支援
+        raise ValueError("環境變數 POSTGRES_URL 未設定！")
     return psycopg2.connect(DB_URL)
 
 def init_db():
-    """初始化雲端資料庫，確保資料表存在"""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    # 1. 建立口袋名單表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS pocket_list (
             user_id TEXT,
@@ -62,8 +53,6 @@ def init_db():
             PRIMARY KEY (user_id, restaurant_name)
         )
     ''')
-    
-    # 2. 建立使用者狀態表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS user_state (
             user_id TEXT PRIMARY KEY,
@@ -75,7 +64,6 @@ def init_db():
     conn.close()
 
 def is_restaurant_exist(user_id, restaurant_name):
-    """檢查該使用者是否已經將該餐廳加入口袋名單 (佔位符改為 %s)"""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
@@ -88,18 +76,14 @@ def is_restaurant_exist(user_id, restaurant_name):
     return result is not None
 
 def add_restaurant(user_id, restaurant_name):
-    """將餐廳寫入該使用者的清單中 (改用 PostgreSQL 的 ON CONFLICT 語法)"""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        # PostgreSQL 的標準作法：若主鍵衝突則什麼都不做 (DO NOTHING)
         cursor.execute('''
             INSERT INTO pocket_list (user_id, restaurant_name) 
             VALUES (%s, %s)
             ON CONFLICT (user_id, restaurant_name) DO NOTHING
         ''', (user_id, restaurant_name))
-        
-        # cursor.rowcount 可以知道有沒有成功塞入資料，如果等於 0 代表衝突跳過了
         success = cursor.rowcount > 0
         conn.commit()
     except Exception as e:
@@ -111,16 +95,13 @@ def add_restaurant(user_id, restaurant_name):
     return success
 
 def delete_restaurant(user_id, restaurant_name):
-    """將特定使用者的某間餐廳從資料庫刪除"""
-    init_db()  # 防禦性設計
+    init_db()
     conn = get_db_connection()
     cursor = conn.cursor()
-    
     cursor.execute(
         'DELETE FROM pocket_list WHERE user_id = %s AND restaurant_name = %s',
         (user_id, restaurant_name)
     )
-    
     changes = cursor.rowcount
     conn.commit()
     cursor.close()
@@ -128,7 +109,6 @@ def delete_restaurant(user_id, restaurant_name):
     return changes > 0
 
 def get_user_pocket_list(user_id):
-    """取得特定使用者的名單"""
     init_db() 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -146,7 +126,6 @@ def get_user_pocket_list(user_id):
         conn.close()
 
 def set_user_state(user_id, state):
-    """設定使用者的狀態 (改用 PostgreSQL 的 ON CONFLICT ... DO UPDATE 語法)"""
     init_db()
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -159,7 +138,6 @@ def set_user_state(user_id, state):
     conn.close()
 
 def get_user_state(user_id):
-    """取得使用者目前狀態"""
     init_db()
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -171,36 +149,30 @@ def get_user_state(user_id):
 
 # ====================================================================
 
-
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
     app.logger.info("Request body: " + body)
-
     try:
         line_handler.handle(body, signature)
     except InvalidSignatureError:
-        app.logger.info("Invalid signature. Please check your channel access token/channel secret.")
+        app.logger.info("Invalid signature.")
         abort(400)
-
     return 'OK'
 
 @line_handler.add(FollowEvent)
 def handle_follow(event):
-    # 新加入好友時，主動發送歡迎訊息並帶上 Quick Reply 選單
     send_reply(event.reply_token, [TextMessage(text="嗨！我是你的口袋名單助手，請選擇你想執行的功能：")], include_menu=True)
 
-
 def get_main_quick_reply():
-    """產生主功能的 Quick Reply 選單 (使用 Postback 隱藏狀態切換)"""
     return QuickReply(
         items=[
             QuickReplyItem(
                 action=PostbackAction(label="➕ 加入餐廳", data="menu_action=click_add", displayText="點擊了加入餐廳")
             ),
             QuickReplyItem(
-                action=PostbackAction(label="📋 我的口袋名單", data="menu_action=click_list", displayText="查看口袋名單")
+                action=PostbackAction(label="📋 我的口袋名單", data="menu_action=click_list&page=1", displayText="查看口袋名單")
             ),
             QuickReplyItem(
                 action=PostbackAction(label="❌ 刪除餐廳", data="menu_action=click_delete", displayText="點擊了刪除餐廳")
@@ -208,23 +180,71 @@ def get_main_quick_reply():
         ]
     )
 
+# ==================== 輪播圖卡產生邏輯 ====================
+def get_carousel_list_message(user_list, page=1):
+    """將餐廳清單轉換為 Carousel Template，支援分頁"""
+    total_count = len(user_list)
+    
+    # 每頁最多顯示 9 個餐廳，保留 1 個位置放「下一頁」圖卡
+    # 如果總數小於等於 10，則不需分頁，直接全塞
+    if total_count <= 10:
+        page_size = 10
+        has_next = False
+    else:
+        page_size = 9
+        has_next = (page * page_size) < total_count
+
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    current_page_items = user_list[start_idx:end_idx]
+
+    columns = []
+    for idx, name in enumerate(current_page_items, start=start_idx + 1):
+        columns.append(
+            CarouselColumn(
+                title=f"📍 餐廳名單 ({idx}/{total_count})",
+                text=f"店名：{name}",
+                actions=[
+                    PostbackAction(
+                        label="❌ 刪除這間餐廳",
+                        data=f"action=delete_confirm&name={urllib.parse.quote(name)}",
+                        displayText=f"想要刪除 {name}"
+                    )
+                ]
+            )
+        )
+
+    # 塞入「下一頁」的特殊卡片
+    if has_next:
+        columns.append(
+            CarouselColumn(
+                title="▶️ 還有更多餐廳喔",
+                text=f"目前顯示第 {start_idx+1}~{min(end_idx, total_count)} 間",
+                actions=[
+                    PostbackAction(
+                        label="看下一頁",
+                        data=f"menu_action=click_list&page={page + 1}",
+                        displayText="查看下一頁名單"
+                    )
+                ]
+            )
+        )
+
+    carousel_template = CarouselTemplate(columns=columns)
+    return TemplateMessage(alt_text="你的口袋名單輪播", template=carousel_template)
+
 
 @line_handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_message = event.message.text.strip()
     user_id = event.source.user_id 
-    
-    # 檢查使用者當前的狀態
     current_state = get_user_state(user_id)
 
     # ------ 狀態 A：等待使用者輸入「要加入的餐廳名稱」 ------
     if current_state == 'WAIT_FOR_ADD':
         restaurant_name = user_message
-        
-        # 收到名稱後，先回復成 IDLE 狀態，避免下次輸入被誤判
         set_user_state(user_id, 'IDLE')
         
-        # 彈出確認視窗
         buttons_template = ButtonsTemplate(
             title="確認加入名單",
             text=f"確定要將「{restaurant_name}」加入口袋名單嗎?",
@@ -241,11 +261,7 @@ def handle_message(event):
                 )
             ]
         )
-        template_message = TemplateMessage(
-            alt_text="請確認是否加入口袋名單",
-            template=buttons_template
-        )
-        send_reply(event.reply_token, [template_message])
+        send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否加入口袋名單", template=buttons_template)])
         return
 
     # ------ 狀態 B：等待使用者輸入「要刪除的餐廳名稱」 ------
@@ -253,13 +269,11 @@ def handle_message(event):
         restaurant_name = user_message
         set_user_state(user_id, 'IDLE')
 
-        # 檢查名單有沒有這家店
         if not is_restaurant_exist(user_id, restaurant_name):
             reply_text = f"你的口袋名單裡本來就沒有「{restaurant_name}」喔。"
             send_reply(event.reply_token, [TextMessage(text=reply_text)], include_menu=True)
             return
 
-        # 跳出刪除確認按鈕
         buttons_template = ButtonsTemplate(
             title="刪除口袋名單",
             text=f"你確定要將「{restaurant_name}」從口袋名單中移除嗎？",
@@ -276,26 +290,19 @@ def handle_message(event):
                 )
             ]
         )
-        template_message = TemplateMessage(
-            alt_text="請確認是否刪除餐廳",
-            template=buttons_template
-        )
-        send_reply(event.reply_token, [template_message])
+        send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否刪除餐廳", template=buttons_template)])
         return
 
-    # ------ 一般狀態 (IDLE) 底下的關鍵字相容（保留原本純文字指令，防禦用） ------
+    # ------ 一般狀態 (IDLE) 底下的關鍵字相容 ------
     if user_message == '我的口袋名單':
         user_list = get_user_pocket_list(user_id)
-        count = len(user_list)
-        if count == 0:
-            reply_text = "目前的口袋名單空空如也喔！快去加入餐廳吧。"
+        if not user_list:
+            send_reply(event.reply_token, [TextMessage(text="目前的口袋名單空空如也喔！快去加入餐廳吧。")], include_menu=True)
         else:
-            list_content = "\n".join([f"{i+1}. {name}" for i, name in enumerate(user_list)])
-            reply_text = f"你的口袋名單目前共有 {count} 間餐廳：\n\n{list_content}"
-        send_reply(event.reply_token, [TextMessage(text=reply_text)], include_menu=True)
-    
+            # 預設顯示第 1 頁
+            carousel_msg = get_carousel_list_message(user_list, page=1)
+            send_reply(event.reply_token, [carousel_msg], include_menu=True)
     else:
-        # 如果使用者輸入了看不懂的字，貼心地彈出選單提示他
         send_reply(event.reply_token, [TextMessage(text="請點選下方選單來操作喔！")], include_menu=True)
 
 
@@ -308,7 +315,7 @@ def handle_postback(event):
     menu_action = params.get('menu_action')
     action = params.get('action')
     
-    # ================= 1. 處理 Quick Reply 導向的選單動作 =================
+    # ================= 1. 處理 Quick Reply 與分頁導向的選單動作 =================
     if menu_action == 'click_add':
         set_user_state(user_id, 'WAIT_FOR_ADD')
         send_reply(event.reply_token, [TextMessage(text="請直接輸入你想加入的餐廳名稱：")])
@@ -320,18 +327,18 @@ def handle_postback(event):
         return
         
     elif menu_action == 'click_list':
-        # 點選查看名單，直接撈資料回覆
+        # 取得要顯示的頁碼，預設為 1
+        page = int(params.get('page', 1))
         user_list = get_user_pocket_list(user_id)
-        count = len(user_list)
-        if count == 0:
+        if not user_list:
             reply_text = "目前的口袋名單空空如也喔！快去加入餐廳吧。"
+            send_reply(event.reply_token, [TextMessage(text=reply_text)], include_menu=True)
         else:
-            list_content = "\n".join([f"{i+1}. {name}" for i, name in enumerate(user_list)])
-            reply_text = f"你的口袋名單目前共有 {count} 間餐廳：\n\n{list_content}"
-        send_reply(event.reply_token, [TextMessage(text=reply_text)], include_menu=True)
+            carousel_msg = get_carousel_list_message(user_list, page=page)
+            send_reply(event.reply_token, [carousel_msg], include_menu=True)
         return
 
-    # ================= 2. 處理 Buttons Template 的確認/取消動作 =================
+    # ================= 2. 處理 Buttons / Carousel Template 的動作 =================
     if action == 'add':
         restaurant_name = urllib.parse.unquote(params.get('name', ''))
         if is_restaurant_exist(user_id, restaurant_name):
@@ -358,7 +365,7 @@ def handle_postback(event):
 
 
 def send_reply(reply_token, messages, include_menu=False):
-    # 控制是否在最後一句話附帶選單
+    # 如果最後一個訊息是 TemplateMessage，LINE 規格不允許依附 QuickReply，所以只加在 TextMessage 上
     if include_menu and messages and isinstance(messages[-1], TextMessage):
         messages[-1].quick_reply = get_main_quick_reply()
 
