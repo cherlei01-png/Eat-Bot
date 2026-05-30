@@ -279,9 +279,8 @@ def get_list_quick_reply(total_count, page=1):
     return QuickReply(items=items)
 
 
-# ==================== 輪播圖卡產生邏輯 ====================
+# ==================== 輪播圖卡產生邏輯（修正安全編碼版） ====================
 def get_carousel_list_message(user_id, user_list, page=1):
-    """修改點：按鈕動態切換（有網址開啟地圖，沒網址加入地點）"""
     total_count = len(user_list)
     page_size = 10
     
@@ -292,24 +291,36 @@ def get_carousel_list_message(user_id, user_list, page=1):
     columns = []
     for idx, res_data in enumerate(current_page_items, start=start_idx + 1):
         name = res_data['name']
-        url = res_data['url']
+        url = res_data['url']  # 資料庫撈出來的網址
         
         tags = get_restaurant_tags(user_id, name)
         tag_text = " ".join([f"#{t}" for t in tags]) if tags else "暫無標籤"
         display_title = name[:40]
 
-        # 核心優化：一個卡片最多放 3 個按鈕，我們先放固定的刪除與標籤
+        # 固定必有的兩個按鈕
         card_actions = [
             PostbackAction(label="🏷️ 加入標籤", data=f"action=click_add_tag&name={urllib.parse.quote(name)}", displayText=f"想為 {name} 新增標籤"),
             PostbackAction(label="❌ 刪除這間餐廳", data=f"action=ask_delete&name={urllib.parse.quote(name)}", displayText=f"想要移除 {name}")
         ]
 
-        # 核心優化：根據 url 是否存在，動態塞入第 3 個按鈕
+        # 根據 url 是否存在，動態塞入第 3 個按鈕
         if url:
-            # 有網址，直接放 URIAction，點擊後手機會直接打開 Google 地圖
-            card_actions.insert(0, URIAction(label="🌐 開啟地圖", uri=url))
+            try:
+                # 💡 核心修正：如果原本存的是舊格式，我們重新將它用官方標準安全格式包裝
+                # 提取出網址後方的座標或名稱
+                if "maps.google.com/7" in url:
+                    raw_query = url.split("maps.google.com/7")[-1]
+                else:
+                    raw_query = url
+                
+                # 使用 Google 官方標準 Search API 格式，並進行安全網址編碼，保證 LINE 絕不卡死
+                safe_url = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(raw_query)}"
+                card_actions.insert(0, URIAction(label="🌐 開啟地圖", uri=safe_url))
+            except Exception as e:
+                print(f"URL Encode Error: {e}")
+                card_actions.insert(0, PostbackAction(label="📍 加入地點", data=f"action=click_add_url&name={urllib.parse.quote(name)}", displayText=f"為 {name} 設定地點"))
         else:
-            # 沒網址，引導去輸入地點網址
+            # 沒網址，引導去輸入地點座標
             card_actions.insert(0, PostbackAction(label="📍 加入地點", data=f"action=click_add_url&name={urllib.parse.quote(name)}", displayText=f"為 {name} 設定地點"))
 
         columns.append(
@@ -396,7 +407,7 @@ def handle_message(event):
 
         # 格式完全正確，直接將拼好的 Google Maps 導航連結準備好
         # 用經緯度導航的官方萬用格式：https://www.google.com/maps/search/?api=1&query=緯度,經度
-        target_url = f"https://www.google.com/maps/search/?api=1&query={cleaned_message}"
+        target_url = cleaned_message
 
         # 彈出確認視窗
         buttons_template = ButtonsTemplate(
