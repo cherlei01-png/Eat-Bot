@@ -13,8 +13,8 @@ from linebot.v3.messaging import (
     ReplyMessageRequest,
     TemplateMessage,
     ButtonsTemplate,
-    CarouselTemplate,      # 新增
-    CarouselColumn,        # 新增
+    CarouselTemplate,
+    CarouselColumn,
     PostbackAction,
     TextMessage,
     QuickReply,
@@ -165,7 +165,9 @@ def callback():
 def handle_follow(event):
     send_reply(event.reply_token, [TextMessage(text="嗨！我是你的口袋名單助手，請選擇你想執行的功能：")], include_menu=True)
 
+
 def get_main_quick_reply():
+    """調整：移除原本的刪除按鈕，只保留加入與查看名單"""
     return QuickReply(
         items=[
             QuickReplyItem(
@@ -173,9 +175,6 @@ def get_main_quick_reply():
             ),
             QuickReplyItem(
                 action=PostbackAction(label="📋 我的口袋名單", data="menu_action=click_list&page=1", displayText="查看口袋名單")
-            ),
-            QuickReplyItem(
-                action=PostbackAction(label="❌ 刪除餐廳", data="menu_action=click_delete", displayText="點擊了刪除餐廳")
             )
         ]
     )
@@ -185,8 +184,6 @@ def get_carousel_list_message(user_list, page=1):
     """將餐廳清單轉換為 Carousel Template，支援分頁"""
     total_count = len(user_list)
     
-    # 每頁最多顯示 9 個餐廳，保留 1 個位置放「下一頁」圖卡
-    # 如果總數小於等於 10，則不需分頁，直接全塞
     if total_count <= 10:
         page_size = 10
         has_next = False
@@ -205,16 +202,16 @@ def get_carousel_list_message(user_list, page=1):
                 title=f"📍 餐廳名單 ({idx}/{total_count})",
                 text=f"店名：{name}",
                 actions=[
+                    # 調整：點擊不直接刪除，而是觸發 ask_delete 進入確認畫面
                     PostbackAction(
                         label="❌ 刪除這間餐廳",
-                        data=f"action=delete_confirm&name={urllib.parse.quote(name)}",
-                        displayText=f"想要刪除 {name}"
+                        data=f"action=ask_delete&name={urllib.parse.quote(name)}",
+                        displayText=f"想要移除 {name}"
                     )
                 ]
             )
         )
 
-    # 塞入「下一頁」的特殊卡片
     if has_next:
         columns.append(
             CarouselColumn(
@@ -264,44 +261,16 @@ def handle_message(event):
         send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否加入口袋名單", template=buttons_template)])
         return
 
-    # ------ 狀態 B：等待使用者輸入「要刪除的餐廳名稱」 ------
-    elif current_state == 'WAIT_FOR_DELETE':
-        restaurant_name = user_message
-        set_user_state(user_id, 'IDLE')
-
-        if not is_restaurant_exist(user_id, restaurant_name):
-            reply_text = f"你的口袋名單裡本來就沒有「{restaurant_name}」喔。"
-            send_reply(event.reply_token, [TextMessage(text=reply_text)], include_menu=True)
-            return
-
-        buttons_template = ButtonsTemplate(
-            title="刪除口袋名單",
-            text=f"你確定要將「{restaurant_name}」從口袋名單中移除嗎？",
-            actions=[
-                PostbackAction(
-                    label="確認刪除",
-                    data=f"action=delete_confirm&name={urllib.parse.quote(restaurant_name)}",
-                    displayText=f"確認刪除 {restaurant_name}"
-                ),
-                PostbackAction(
-                    label="取消",
-                    data="action=delete_cancel",
-                    displayText="取消刪除"
-                )
-            ]
-        )
-        send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否刪除餐廳", template=buttons_template)])
-        return
-
     # ------ 一般狀態 (IDLE) 底下的關鍵字相容 ------
     if user_message == '我的口袋名單':
         user_list = get_user_pocket_list(user_id)
         if not user_list:
             send_reply(event.reply_token, [TextMessage(text="目前的口袋名單空空如也喔！快去加入餐廳吧。")], include_menu=True)
         else:
-            # 預設顯示第 1 頁
+            # 調整：同時發送「圖卡」與「帶有主選單的提示文字」
             carousel_msg = get_carousel_list_message(user_list, page=1)
-            send_reply(event.reply_token, [carousel_msg], include_menu=True)
+            hint_msg = TextMessage(text="以上是您的口袋名單，您也可以透過下方選單繼續操作：")
+            send_reply(event.reply_token, [carousel_msg, hint_msg], include_menu=True)
     else:
         send_reply(event.reply_token, [TextMessage(text="請點選下方選單來操作喔！")], include_menu=True)
 
@@ -321,21 +290,17 @@ def handle_postback(event):
         send_reply(event.reply_token, [TextMessage(text="請直接輸入你想加入的餐廳名稱：")])
         return
         
-    elif menu_action == 'click_delete':
-        set_user_state(user_id, 'WAIT_FOR_DELETE')
-        send_reply(event.reply_token, [TextMessage(text="請直接輸入你想刪除的餐廳名稱：")])
-        return
-        
     elif menu_action == 'click_list':
-        # 取得要顯示的頁碼，預設為 1
         page = int(params.get('page', 1))
         user_list = get_user_pocket_list(user_id)
         if not user_list:
             reply_text = "目前的口袋名單空空如也喔！快去加入餐廳吧。"
             send_reply(event.reply_token, [TextMessage(text=reply_text)], include_menu=True)
         else:
+            # 調整：這裡也是點選看名單/下一頁時，同時附帶圖卡與選單提示
             carousel_msg = get_carousel_list_message(user_list, page=page)
-            send_reply(event.reply_token, [carousel_msg], include_menu=True)
+            hint_msg = TextMessage(text="可以滑動查看名單，或是點選下方功能：")
+            send_reply(event.reply_token, [carousel_msg, hint_msg], include_menu=True)
         return
 
     # ================= 2. 處理 Buttons / Carousel Template 的動作 =================
@@ -351,13 +316,34 @@ def handle_postback(event):
     elif action == 'cancel':
         send_reply(event.reply_token, [TextMessage(text="好的，已取消加入。")], include_menu=True)
 
+    # 新增：點擊圖卡刪除後，跳出二次確認視窗
+    elif action == 'ask_delete':
+        restaurant_name = urllib.parse.unquote(params.get('name', ''))
+        buttons_template = ButtonsTemplate(
+            title="確認刪除",
+            text=f"你確定要將「{restaurant_name}」從口袋名單中移除嗎？",
+            actions=[
+                PostbackAction(
+                    label="確認刪除",
+                    data=f"action=delete_confirm&name={urllib.parse.quote(restaurant_name)}",
+                    displayText=f"確認刪除 {restaurant_name}"
+                ),
+                PostbackAction(
+                    label="取消",
+                    data="action=delete_cancel",
+                    displayText="取消刪除"
+                )
+            ]
+        )
+        send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否刪除餐廳", template=buttons_template)])
+
     elif action == 'delete_confirm':
         restaurant_name = urllib.parse.unquote(params.get('name', ''))
         is_deleted = delete_restaurant(user_id, restaurant_name)
         if is_deleted:
             reply_text = f"已將「{restaurant_name}」從你的口袋名單中移除！"
         else:
-            reply_text = f"這張卡片失效囉！名單內已無「{restaurant_name}」。"
+            reply_text = f"這張卡片失效囉！名單內已無「{restaurant_name}」"
         send_reply(event.reply_token, [TextMessage(text=reply_text)], include_menu=True)
         
     elif action == 'delete_cancel':
@@ -365,7 +351,6 @@ def handle_postback(event):
 
 
 def send_reply(reply_token, messages, include_menu=False):
-    # 如果最後一個訊息是 TemplateMessage，LINE 規格不允許依附 QuickReply，所以只加在 TextMessage 上
     if include_menu and messages and isinstance(messages[-1], TextMessage):
         messages[-1].quick_reply = get_main_quick_reply()
 
