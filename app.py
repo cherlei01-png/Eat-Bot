@@ -306,15 +306,16 @@ def get_carousel_list_message(user_id, user_list, page=1):
         # 根據 url 是否存在，動態塞入第 3 個按鈕
         if url:
             try:
-                # 💡 核心修正：如果原本存的是舊格式，我們重新將它用官方標準安全格式包裝
-                # 提取出網址後方的座標或名稱
-                if "maps.google.com/7" in url:
-                    raw_query = url.split("maps.google.com/7")[-1]
-                else:
-                    raw_query = url
+                # 先把可能不小心存進資料庫的舊網址開頭清乾淨，只留下最核心的座標或名稱字串
+                clean_query = url.replace("https://www.google.com/maps/search/?api=1&query=", "").strip()
                 
-                # 使用 Google 官方標準 Search API 格式，並進行安全網址編碼，保證 LINE 絕不卡死
-                safe_url = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(raw_query)}"
+                # 進行安全的網址編碼
+                encoded_query = urllib.parse.quote(clean_query)
+                
+                # 🎯 使用 Google Maps 官方最標準、相容性最高的 Universal URL 格式！
+                # 這個格式不論填「名稱」或「經緯度」，Google Maps 都會 100% 完美辨識導航
+                safe_url = f"https://www.google.com/maps/search/?api=1&query={encoded_query}"
+                
                 card_actions.insert(0, URIAction(label="🌐 開啟地圖", uri=safe_url))
             except Exception as e:
                 print(f"URL Encode Error: {e}")
@@ -479,8 +480,11 @@ def handle_postback(event):
             db_url = res_data['url'] # 從資料庫撈出來的網址(可能為 None)
             
             # 💡 核心智慧判斷：有綁定座標網址就用它，沒有的話就動態退化成名稱自動搜尋
+            # 💡 找到隨機推薦裡拼網址的地方，改成跟上面一樣的官方標準格式：
             if db_url:
-                maps_url = db_url
+                # 如果有座標，先清乾淨可能殘留的舊網址開頭
+                clean_coord = db_url.replace("https://www.google.com/maps/search/?api=1&query=", "").strip()
+                maps_url = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(clean_coord)}"
                 nav_label = "🗺️ 開始導航 (精準座標)"
             else:
                 encoded_name = urllib.parse.quote(restaurant_name)
