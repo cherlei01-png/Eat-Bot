@@ -666,9 +666,11 @@ def handle_postback(event):
         ]
         
         # 列出前 11 個分類供使用者點擊查看
-        for cat in user_cats[:11]: 
+        for cat in user_cats[:10]: 
             items.append(QuickReplyItem(action=PostbackAction(label=f"📂 查看：{cat}", data=f"menu_action=show_cat_list&cat={urllib.parse.quote(cat)}&page=1", displayText=f"查看分類【{cat}】")))
         
+        items.append(QuickReplyItem(action=PostbackAction(label="🚪 返回主選單", data="menu_action=exit_list", displayText="返回主選單")))
+
         quick_reply_menu = QuickReply(items=items)
         msg = TextMessage(text="請選擇你想查看的餐廳分類，或點擊進入刪除模式：", quick_reply=quick_reply_menu)
         
@@ -935,10 +937,11 @@ def handle_postback(event):
             return
             
         items = []
-        for cat in user_cats[:12]: # LINE 限制
+        for cat in user_cats[:11]: # LINE 限制
             items.append(QuickReplyItem(action=PostbackAction(label=f"🗑️ 刪除【{cat}】", data=f"action=ask_delete_cat&cat={urllib.parse.quote(cat)}", displayText=f"我想刪除整個【{cat}】分類")))
         
-        items.append(QuickReplyItem(action=PostbackAction(label="🚪 返回", data="menu_action=click_list")))
+        items.append(QuickReplyItem(action=PostbackAction(label="⬅️ 回名單選單", data="menu_action=click_list", displayText="返回名單選擇")))
+        items.append(QuickReplyItem(action=PostbackAction(label="🚪 回主選單", data="menu_action=exit_list", displayText="返回主選單")))
         
         quick_reply_menu = QuickReply(items=items)
         msg = TextMessage(text="🔥 【危險區域】請選擇你想「徹底刪除」的分類：\n(這會解除該分類下所有餐廳的綁定，但餐廳本體不會消失)", quick_reply=quick_reply_menu)
