@@ -377,6 +377,24 @@ def get_user_achievement_stats(user_id):
         conn.close()
     return stats
 
+# 新增：將某家餐廳從特定分類中移除
+def remove_restaurant_from_category(user_id, restaurant_name, category_name):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            DELETE FROM restaurant_categories 
+            WHERE user_id = %s AND restaurant_name = %s AND category = %s
+        ''', (user_id, restaurant_name, category_name))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        print(f"Remove category DB error: {e}")
+        return False
+    finally:
+        cursor.close()
+        conn.close()
+
 # ====================================================================
 
 @app.route("/callback", methods=['POST'])
@@ -421,7 +439,8 @@ def get_list_quick_reply(total_count, page=1):
 
 
 # ==================== 輪播圖卡產生邏輯（修正安全編碼版） ====================
-def get_carousel_list_message(user_id, user_list, page=1):
+# 💡 修改：傳入 current_cat 參數
+def get_carousel_list_message(user_id, user_list, page=1, current_cat='全部'):
     total_count = len(user_list)
     page_size = 10
     
@@ -432,37 +451,39 @@ def get_carousel_list_message(user_id, user_list, page=1):
     columns = []
     for idx, res_data in enumerate(current_page_items, start=start_idx + 1):
         name = res_data['name']
-        url = res_data['url']  # 資料庫撈出來的網址
+        url = res_data['url']
         
         tags = get_restaurant_tags(user_id, name)
         tag_text = " ".join([f"#{t}" for t in tags]) if tags else "暫無標籤"
         display_title = name[:40]
 
-        # 固定必有的兩個按鈕
-        card_actions = [
-            PostbackAction(label="🏷️ 加入#標籤 /分類", data=f"action=click_add_tag&name={urllib.parse.quote(name)}", displayText=f"想為 {name} 新增標籤"),
-            PostbackAction(label="❌ 刪除這間餐廳", data=f"action=ask_delete&name={urllib.parse.quote(name)}", displayText=f"想要移除 {name}")
-        ]
+        # 💡 按鈕 1：加入標籤
+        btn_tag = PostbackAction(label="🏷️ 加入標籤/分類", data=f"action=click_add_tag&name={urllib.parse.quote(name)}", displayText=f"想為 {name} 新增標籤或分類")
 
-        # 根據 url 是否存在，動態塞入第 3 個按鈕
+        # 💡 按鈕 2：動態判斷（關鍵！）
+        if current_cat == '全部':
+            # 如果在全部餐廳頁面，顯示「完全刪除」這家餐廳
+            btn_delete = PostbackAction(label="❌ 刪除這間餐廳", data=f"action=ask_delete&name={urllib.parse.quote(name)}", displayText=f"想要完全移除 {name}")
+        else:
+            # 如果在特定分類頁面，顯示「移出此分類」
+            btn_delete = PostbackAction(
+                label=f"📂 移出此分類", 
+                data=f"action=ask_remove_cat&name={urllib.parse.quote(name)}&cat={urllib.parse.quote(current_cat)}", 
+                displayText=f"想將 {name} 從分類【{current_cat}】中移出"
+            )
+
+        card_actions = [btn_tag, btn_delete]
+
+        # 地圖導航按鈕
         if url:
             try:
-                # 先把可能不小心存進資料庫的舊網址開頭清乾淨，只留下最核心的座標或名稱字串
                 clean_query = url.replace("https://www.google.com/maps/search/?api=1&query=", "").strip()
-                
-                # 進行安全的網址編碼
                 encoded_query = urllib.parse.quote(clean_query)
-                
-                # 🎯 使用 Google Maps 官方最標準、相容性最高的 Universal URL 格式！
-                # 這個格式不論填「名稱」或「經緯度」，Google Maps 都會 100% 完美辨識導航
                 safe_url = f"https://www.google.com/maps/search/?api=1&query={encoded_query}"
-                
                 card_actions.insert(0, URIAction(label="🌐 開啟地圖", uri=safe_url))
-            except Exception as e:
-                print(f"URL Encode Error: {e}")
+            except Exception:
                 card_actions.insert(0, PostbackAction(label="📍 加入地點", data=f"action=click_add_url&name={urllib.parse.quote(name)}", displayText=f"為 {name} 設定地點"))
         else:
-            # 沒網址，引導去輸入地點座標
             card_actions.insert(0, PostbackAction(label="📍 加入地點", data=f"action=click_add_url&name={urllib.parse.quote(name)}", displayText=f"為 {name} 設定地點"))
 
         columns.append(
@@ -504,7 +525,6 @@ def handle_message(event):
         _, target_restaurant = current_state.split('|', 1)
         set_user_state(user_id, 'IDLE')
 
-        # 將輸入依照空白切開
         tokens = user_message.split()
         tags_to_add = []
         categories_to_add = []
@@ -521,7 +541,33 @@ def handle_message(event):
             send_reply(event.reply_token, [TextMessage(text="未偵測到以 # 開頭的標籤或 / 開頭的分類，操作已取消。")], menu_type='main')
             return
 
-        # 寫入資料庫
+        # 💡 核心改動：檢查分類數量限制 (包括「全部」，所以現有不重複分類最多只能有 9 個)
+        if categories_to_add:
+            existing_cats = get_user_all_categories(user_id)
+            
+            # 算出如果把「新輸入且不重複」的分類加進去後，總共會有幾個分類
+            new_unique_cats = set(existing_cats) | set(categories_to_add)
+            
+            # 總分類數 = 不重複分類 + '全部'(1個)
+            if len(new_unique_cats) + 1 > 10:
+                # 擋下分類，但如果使用者有輸入標籤，我們還是幫他寫入標籤（符合你的需求！）
+                if tags_to_add:
+                    add_restaurant_tags(user_id, target_restaurant, tags_to_add)
+                    error_text = (
+                        f"⚠️ 標籤設定成功！但【分類設定失敗】\n\n"
+                        f"因為 LINE 快速回應限制，您最多只能擁有 10 個分類（含全部）。\n"
+                        f"目前已有 {len(existing_cats) + 1} 個分類，請先至舊分類移除不必要的餐廳再試。"
+                    )
+                else:
+                    error_text = (
+                        f"⚠️ 設定失敗！\n\n"
+                        f"您目前的分類數量已達 10 個上限（含全部），無法再新增全新分類！\n"
+                        f"請先至其他分類中將餐廳移除，釋出分類額度。"
+                    )
+                send_reply(event.reply_token, [TextMessage(text=error_text)], menu_type='main')
+                return
+
+        # 檢查通過，正常寫入資料庫
         if tags_to_add:
             add_restaurant_tags(user_id, target_restaurant, tags_to_add)
         if categories_to_add:
@@ -619,8 +665,8 @@ def handle_postback(event):
         if not user_list:
             send_reply(event.reply_token, [TextMessage(text=f"分類【{target_cat}】目前沒有餐廳喔！")], menu_type='main')
         else:
-            carousel_msg = get_carousel_list_message(user_id, user_list, page=page)
-            # 為了讓分頁能記住目前在選哪個分類，稍微調整 QuickReply 的傳值
+# 找到這一行，補上 target_cat 參數：
+            carousel_msg = get_carousel_list_message(user_id, user_list, page=page, current_cat=target_cat)            # 為了讓分頁能記住目前在選哪個分類，稍微調整 QuickReply 的傳值
             hint_msg = TextMessage(text=f"📂 當前分類：{target_cat} (第 {page} 頁)")
             
             # 動態覆寫下一頁的 QuickReply
@@ -822,6 +868,42 @@ def handle_postback(event):
         # 寫入歷史紀錄，啟動 5 次排除冷卻機制
         add_to_cooling_history(user_id, restaurant_name)
         reply_text = f"👌 已幫你記錄！祝你用餐愉快！「{restaurant_name}」將進入冷卻"
+        send_reply(event.reply_token, [TextMessage(text=reply_text)], menu_type='main')
+        return
+    
+    # 1. 點擊「移出此分類」，跳出 ButtonsTemplate 確認視窗
+    elif action == 'ask_remove_cat':
+        res_name = urllib.parse.unquote(params.get('name', ''))
+        cat_name = urllib.parse.unquote(params.get('cat', ''))
+        
+        confirm_button = ButtonsTemplate(
+            title="確認移除分類",
+            text=f"確定要將「{res_name}」從【{cat_name}】分類中移出嗎？(餐廳不會被刪除)",
+            actions=[
+                PostbackAction(
+                    label="確認移除", 
+                    data=f"action=remove_cat_confirm&name={urllib.parse.quote(res_name)}&cat={urllib.parse.quote(cat_name)}", 
+                    displayText="確認移除分類"
+                ),
+                PostbackAction(label="取消", data="action=cancel", displayText="取消操作")
+            ]
+        )
+        send_reply(event.reply_token, [TemplateMessage(alt_text="確認移除分類", template=confirm_button)])
+        return
+
+    # 2. 使用者在確認視窗點擊「確認移除」
+    elif action == 'remove_cat_confirm':
+        res_name = urllib.parse.unquote(params.get('name', ''))
+        cat_name = urllib.parse.unquote(params.get('cat', ''))
+        
+        # 執行資料庫刪除
+        success = remove_restaurant_from_category(user_id, res_name, cat_name)
+        
+        if success:
+            reply_text = f"✨ 已將「{res_name}」成功從【{cat_name}】分類中移出！"
+        else:
+            reply_text = f"❌ 移除失敗，或該餐廳原本就不在【{cat_name}】分類中。"
+            
         send_reply(event.reply_token, [TextMessage(text=reply_text)], menu_type='main')
         return
 
