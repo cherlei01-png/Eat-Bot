@@ -19,7 +19,8 @@ from linebot.v3.messaging import (
     URIAction,
     TextMessage,
     QuickReply,
-    QuickReplyItem
+    QuickReplyItem,
+    LocationMessageContent
 )
 from linebot.v3.webhooks import (
     MessageEvent,
@@ -516,129 +517,159 @@ def get_carousel_list_message(user_id, user_list, page=1, current_cat='全部'):
     return TemplateMessage(alt_text="你的口袋名單輪播", template=carousel_template)
 
 
-@line_handler.add(MessageEvent, message=TextMessageContent)
+# 🎯 修正核心 1：移除 message=TextMessageContent 限制，讓所有訊息事件都能進來
+@line_handler.add(MessageEvent)
 def handle_message(event):
-    user_message = event.message.text.strip()
     user_id = event.source.user_id 
     current_state = get_user_state(user_id)
 
-    # ------ 狀態 A：等待使用者輸入「要加入的餐廳名稱」 ------
-    if current_state == 'WAIT_FOR_ADD':
-        restaurant_name = user_message
-        set_user_state(user_id, 'IDLE')
-        
-        buttons_template = ButtonsTemplate(
-            title="確認加入名單",
-            text=f"確定要將「{restaurant_name}」加入口袋名單嗎?",
-            actions=[
-                PostbackAction(label="確認加入", data=f"action=add&name={urllib.parse.quote(restaurant_name)}", displayText=f"確認加入 {restaurant_name}"),
-                PostbackAction(label="取消", data="action=cancel", displayText="取消操作")
-            ]
-        )
-        send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否加入口袋名單", template=buttons_template)])
-        return
+    # ====================================================
+    # 📍 分流 A：如果使用者傳送的是「LINE 原生地圖位置資訊」
+    # ====================================================
+    if isinstance(event.message, LocationMessageContent):
+        # 檢查是不是在等待輸入地點的狀態
+        if current_state.startswith('WAIT_FOR_URL|'):
+            _, target_restaurant = current_state.split('|', 1)
+            set_user_state(user_id, 'IDLE')
 
-    # ------ 狀態 C：等待使用者輸入「標籤」 ------
-    elif current_state.startswith('WAIT_FOR_TAG|'):
-        _, target_restaurant = current_state.split('|', 1)
-        set_user_state(user_id, 'IDLE')
+            # 直接從 LINE 的物件中抓取緯度（latitude）與經度（longitude）
+            lat = event.message.latitude
+            lng = event.message.longitude
+            
+            # 拼成我們資料庫統一使用的「緯度, 經度」字串格式
+            target_url = f"{lat}, {lng}"
 
-        tokens = user_message.split()
-        tags_to_add = []
-        categories_to_add = []
-
-        for token in tokens:
-            if token.startswith('#'):
-                t_name = token[1:].strip()
-                if t_name: tags_to_add.append(t_name)
-            elif token.startswith('/'):
-                c_name = token[1:].strip()
-                if c_name: categories_to_add.append(c_name)
-
-        if not tags_to_add and not categories_to_add:
-            send_reply(event.reply_token, [TextMessage(text="未偵測到以 # 開頭的標籤或 / 開頭的分類，操作已取消。")], menu_type='main')
+            # 彈出確認綁定視窗（後續流程與文字輸入完全無縫接軌！）
+            buttons_template = ButtonsTemplate(
+                title="確認位置設定",
+                text=f"已成功識別 LINE 定位！要為「{target_restaurant}」綁定這個位置嗎？",
+                actions=[
+                    PostbackAction(label="確認設定位置", data=f"action=url_confirm&name={urllib.parse.quote(target_restaurant)}&url={urllib.parse.quote(target_url)}", displayText="確認設定位置"),
+                    PostbackAction(label="取消", data="action=cancel", displayText="取消操作")
+                ]
+            )
+            send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否綁定地圖位置", template=buttons_template)])
+            return
+        else:
+            # 防呆：如果平常沒事亂傳位置，給予親切提示
+            send_reply(event.reply_token, [TextMessage(text="📍 收到您的位置！若要將其設定為餐廳地點，請先點選口袋名單圖卡上的「📍 加入地點」按鈕喔！")], menu_type='main')
             return
 
-        # 💡 核心改動：檢查分類數量限制 (包括「全部」，所以現有不重複分類最多只能有 9 個)
-        if categories_to_add:
-            existing_cats = get_user_all_categories(user_id)
+    # ====================================================
+    # ✍️ 分流 B：如果使用者傳送的是「一般文字」（你原本的所有邏輯，一字不漏包在這裡）
+    # ====================================================
+    elif isinstance(event.message, TextMessageContent):
+        user_message = event.message.text.strip()
+
+        # ------ 狀態 A：等待使用者輸入「要加入的餐廳名稱」 ------
+        if current_state == 'WAIT_FOR_ADD':
+            restaurant_name = user_message
+            set_user_state(user_id, 'IDLE')
             
-            # 算出如果把「新輸入且不重複」的分類加進去後，總共會有幾個分類
-            new_unique_cats = set(existing_cats) | set(categories_to_add)
+            buttons_template = ButtonsTemplate(
+                title="確認加入名單",
+                text=f"確定要將「{restaurant_name}」加入口袋名單嗎?",
+                actions=[
+                    PostbackAction(label="確認加入", data=f"action=add&name={urllib.parse.quote(restaurant_name)}", displayText=f"確認加入 {restaurant_name}"),
+                    PostbackAction(label="取消", data="action=cancel", displayText="取消操作")
+                ]
+            )
+            send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否加入口袋名單", template=buttons_template)])
+            return
+
+        # ------ 狀態 C：等待使用者輸入「標籤」 ------
+        elif current_state.startswith('WAIT_FOR_TAG|'):
+            _, target_restaurant = current_state.split('|', 1)
+            set_user_state(user_id, 'IDLE')
+
+            tokens = user_message.split()
+            tags_to_add = []
+            categories_to_add = []
+
+            for token in tokens:
+                if token.startswith('#'):
+                    t_name = token[1:].strip()
+                    if t_name: tags_to_add.append(t_name)
+                elif token.startswith('/'):
+                    c_name = token[1:].strip()
+                    if c_name: categories_to_add.append(c_name)
+
+            if not tags_to_add and not categories_to_add:
+                send_reply(event.reply_token, [TextMessage(text="未偵測到以 # 開頭的標籤或 / 開頭的分類，操作已取消。")], menu_type='main')
+                return
+
+            if categories_to_add:
+                existing_cats = get_user_all_categories(user_id)
+                new_unique_cats = set(existing_cats) | set(categories_to_add)
+                
+                if len(new_unique_cats) + 1 > 10:
+                    if tags_to_add:
+                        add_restaurant_tags(user_id, target_restaurant, tags_to_add)
+                        error_text = (
+                            f"⚠️ 標籤設定成功！但【分類設定失敗】\n\n"
+                            f"因為 LINE 快速回應限制，您最多只能擁有 10 個分類（含全部）。\n"
+                            f"目前已有 {len(existing_cats) + 1} 個分類，請先至舊分類移除不必要的餐廳再試。"
+                        )
+                    else:
+                        error_text = (
+                            f"⚠️ 設定失敗！\n\n"
+                            f"您目前的分類數量已達 10 個上限（含全部），無法再新增全新分類！\n"
+                            f"請先至其他分類中將餐廳移除，釋出分類額度。"
+                        )
+                    send_reply(event.reply_token, [TextMessage(text=error_text)], menu_type='main')
+                    return
+
+            if tags_to_add:
+                add_restaurant_tags(user_id, target_restaurant, tags_to_add)
+            if categories_to_add:
+                for cat in categories_to_add:
+                    add_restaurant_category(user_id, target_restaurant, cat)
+
+            summary = "✨ 設定成功！\n"
+            if tags_to_add: summary += f"🏷️ 標籤：{' '.join(['#'+t for t in tags_to_add])}\n"
+            if categories_to_add: summary += f"📂 分類：{' '.join(['/'+c for c in categories_to_add])}"
+
+            send_reply(event.reply_token, [TextMessage(text=summary)], menu_type='main')
+            return
+
+        # ------ 修改狀態 D：等待使用者輸入「經緯度座標」 ------
+        elif current_state.startswith('WAIT_FOR_URL|'):
+            _, target_restaurant = current_state.split('|', 1)
+            set_user_state(user_id, 'IDLE')
+
+            cleaned_message = user_message.replace('(', '').replace(')', '').replace('（', '').replace('）', '').replace('，', ',').strip()
+            coord_pattern = r'^[-+]?([1-8]?\d(\.\d+)?|90(\.0+)?),\s*[-+]?(180(\.0+)?|((1[0-7]\d)|([1-9]?\d))(\.\d+)?)$'
             
-            # 總分類數 = 不重複分類 + '全部'(1個)
-            if len(new_unique_cats) + 1 > 10:
-                # 擋下分類，但如果使用者有輸入標籤，我們還是幫他寫入標籤（符合你的需求！）
-                if tags_to_add:
-                    add_restaurant_tags(user_id, target_restaurant, tags_to_add)
-                    error_text = (
-                        f"⚠️ 標籤設定成功！但【分類設定失敗】\n\n"
-                        f"因為 LINE 快速回應限制，您最多只能擁有 10 個分類（含全部）。\n"
-                        f"目前已有 {len(existing_cats) + 1} 個分類，請先至舊分類移除不必要的餐廳再試。"
-                    )
-                else:
-                    error_text = (
-                        f"⚠️ 設定失敗！\n\n"
-                        f"您目前的分類數量已達 10 個上限（含全部），無法再新增全新分類！\n"
-                        f"請先至其他分類中將餐廳移除，釋出分類額度。"
-                    )
+            if not re.match(coord_pattern, cleaned_message):
+                error_text = "⚠️ 格式錯誤！請確保輸入的是正確的經緯度座標數字（帶有括號也可以哦）。\n範例：(25.0339, 121.5645)"
                 send_reply(event.reply_token, [TextMessage(text=error_text)], menu_type='main')
                 return
 
-        # 檢查通過，正常寫入資料庫
-        if tags_to_add:
-            add_restaurant_tags(user_id, target_restaurant, tags_to_add)
-        if categories_to_add:
-            for cat in categories_to_add:
-                add_restaurant_category(user_id, target_restaurant, cat)
+            target_url = cleaned_message 
 
-        summary = "✨ 設定成功！\n"
-        if tags_to_add: summary += f"🏷️ 標籤：{' '.join(['#'+t for t in tags_to_add])}\n"
-        if categories_to_add: summary += f"📂 分類：{' '.join(['/'+c for c in categories_to_add])}"
-
-        send_reply(event.reply_token, [TextMessage(text=summary)], menu_type='main')
-        return
-
-    # ------ 修改狀態 D：等待使用者輸入「經緯度座標」 ------
-    elif current_state.startswith('WAIT_FOR_URL|'):
-        _, target_restaurant = current_state.split('|', 1)
-        set_user_state(user_id, 'IDLE')
-
-        # 💡 先把可能包含的 ( ) 括號拿掉，並將全形逗號換成半形
-        cleaned_message = user_message.replace('(', '').replace(')', '').replace('（', '').replace('）', '').replace('，', ',').strip()
-
-        # 正規表達式驗證乾淨的經緯度
-        coord_pattern = r'^[-+]?([1-8]?\d(\.\d+)?|90(\.0+)?),\s*[-+]?(180(\.0+)?|((1[0-7]\d)|([1-9]?\d))(\.\d+)?)$'
-        
-        if not re.match(coord_pattern, cleaned_message):
-            error_text = "⚠️ 格式錯誤！請確保輸入的是正確的經緯度座標數字（帶有括號也可以哦）。\n範例：(25.0339, 121.5645)"
-            send_reply(event.reply_token, [TextMessage(text=error_text)], menu_type='main')
+            buttons_template = ButtonsTemplate(
+                title="確認位置設定",
+                text=f"已成功識別座標！要為「{target_restaurant}」綁定這個地圖位置嗎？",
+                actions=[
+                    PostbackAction(label="確認設定位置", data=f"action=url_confirm&name={urllib.parse.quote(target_restaurant)}&url={urllib.parse.quote(target_url)}", displayText="確認設定位置"),
+                    PostbackAction(label="取消", data="action=cancel", displayText="取消操作")
+                ]
+            )
+            send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否綁定地圖位置", template=buttons_template)])
             return
 
-        target_url = cleaned_message 
-
-        buttons_template = ButtonsTemplate(
-            title="確認位置設定",
-            text=f"已成功識別座標！要為「{target_restaurant}」綁定這個地圖位置嗎？",
-            actions=[
-                PostbackAction(label="確認設定位置", data=f"action=url_confirm&name={urllib.parse.quote(target_restaurant)}&url={urllib.parse.quote(target_url)}", displayText="確認設定位置"),
-                PostbackAction(label="取消", data="action=cancel", displayText="取消操作")
-            ]
-        )
-        send_reply(event.reply_token, [TemplateMessage(alt_text="請確認是否綁定地圖位置", template=buttons_template)])
-        return
-
-    # ------ 一般狀態 (IDLE) 底下的關鍵字相容 ------
-    if user_message == '我的口袋名單':
-        user_list = get_user_pocket_list(user_id)
-        if not user_list:
-            send_reply(event.reply_token, [TextMessage(text="目前的口袋名單空空如也喔！快去加入餐廳吧。")], menu_type='main')
+        # ------ 一般狀態 (IDLE) 底下的關鍵字相容 ------
+        if user_message == '我的口袋名單':
+            user_list = get_user_pocket_list(user_id)
+            if not user_list:
+                send_reply(event.reply_token, [TextMessage(text="目前的口袋名單空空如也喔！快去加入餐廳吧。")], menu_type='main')
+            else:
+                carousel_msg = get_carousel_list_message(user_id, user_list, page=1)
+                hint_msg = TextMessage(text="已進入名單模式，您可以使用下方選單切換頁面或退出：")
+                send_reply(event.reply_token, [carousel_msg, hint_msg], menu_type='list', total_count=len(user_list), page=1)
         else:
-            carousel_msg = get_carousel_list_message(user_id, user_list, page=1)
-            hint_msg = TextMessage(text="已進入名單模式，您可以使用下方選單切換頁面或退出：")
-            send_reply(event.reply_token, [carousel_msg, hint_msg], menu_type='list', total_count=len(user_list), page=1)
-    else:
-        send_reply(event.reply_token, [TextMessage(text="請點選下方選單來操作喔！")], menu_type='main')
+            send_reply(event.reply_token, [TextMessage(text="請點選下方選單來操作喔！")], menu_type='main')
+            return
 
 
 @line_handler.add(PostbackEvent)
@@ -839,11 +870,12 @@ def handle_postback(event):
         set_user_state(user_id, f"WAIT_FOR_URL|{restaurant_name}")
         
         guide_text = (
-            f"📌 請輸入「{restaurant_name}」的經緯度座標：\n\n"
-            f"💡 【手機查詢小技巧】\n"
-            f"1️⃣ 打開 Google 地圖，在該餐廳的位置「長按」放下一支紅針。\n"
-            f"2️⃣ 螢幕下方彈出的面板就會出現一串數字（例：25.0339, 121.5645）。\n"
-            f"3️⃣ 直接點擊或長按那串數字進行複製，並「單獨貼回來」這裡就可以囉！"
+            f"📌 請提供「{restaurant_name}」的地圖位置：\n\n"
+            f"💡 【最推薦：使用 LINE 傳送定位】\n"
+            f"1️⃣ 點擊聊天室左下角的「➕」選單。\n"
+            f"2️⃣ 選擇「位置資訊」，搜尋該餐廳或直接釘選發送過來，機器人就會自動抓取座標囉！\n\n"
+            f"✍️ 【備用方案：手工輸入經緯度】\n"
+            f"也可直接輸入括號經緯度，例：(25.0339, 121.5645)"
         )
         send_reply(event.reply_token, [TextMessage(text=guide_text)])
         return
