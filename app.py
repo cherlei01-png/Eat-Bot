@@ -19,14 +19,14 @@ from linebot.v3.messaging import (
     URIAction,
     TextMessage,
     QuickReply,
-    QuickReplyItem,
-    LocationMessageContent
+    QuickReplyItem
 )
 from linebot.v3.webhooks import (
     MessageEvent,
     FollowEvent,
     PostbackEvent,
-    TextMessageContent
+    TextMessageContent,
+    LocationMessageContent
 )
 import urllib.parse
 import psycopg2
