@@ -272,6 +272,21 @@ def get_random_restaurant(user_id):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
+        # 1. 先計算這個使用者目前口袋名單「總共有幾間餐廳」
+        cursor.execute('SELECT COUNT(*) FROM pocket_list WHERE user_id = %s', (user_id,))
+        total_restaurants = cursor.fetchone()[0]
+        
+        if total_restaurants == 0:
+            return None
+            
+        # 2. 動態計算冷卻額度 (LIMIT)
+        # 如果餐廳很少，冷卻上限就是 (總數 - 1)，確保永遠有至少一間餐廳可以被抽到
+        if total_restaurants >= 6:
+            cooling_limit = 5
+        else:
+            cooling_limit = total_restaurants - 1
+
+        # 3. 帶入動態的 LIMIT 進行抽籤
         cursor.execute('''
             SELECT restaurant_name, map_url 
             FROM pocket_list 
@@ -281,14 +296,16 @@ def get_random_restaurant(user_id):
                   FROM user_cooling_history 
                   WHERE user_id = %s 
                   ORDER BY visited_at DESC 
-                  LIMIT 5
+                  LIMIT %s
               )
             ORDER BY RANDOM() 
             LIMIT 1
-        ''', (user_id, user_id))
+        ''', (user_id, user_id, cooling_limit))
+        
         row = cursor.fetchone()
         return {'name': row[0], 'url': row[1]} if row else None
-    except Exception:
+    except Exception as e:
+        print(f"Dynamic random restaurant error: {e}")
         return None
     finally:
         cursor.close()
